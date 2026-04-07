@@ -10,33 +10,32 @@ import (
 	"amaur/api/internal/domain/program"
 
 	"github.com/google/uuid"
-	"github.com/jmoiron/sqlx"
+	"gorm.io/gorm"
 )
 
 type programRepo struct {
-	db *sqlx.DB
+	db *gorm.DB
 }
 
-func NewProgramRepository(db *sqlx.DB) program.Repository {
+func NewProgramRepository(db *gorm.DB) program.Repository {
 	return &programRepo{db: db}
 }
 
 func (r *programRepo) CreateProgram(ctx context.Context, p *program.CompanyProgram) error {
-	_, err := r.db.NamedExecContext(ctx, `
+	return rawExec(ctx, r.db, `
 		INSERT INTO company_programs (
 			id, company_id, contract_id, name, start_date, end_date,
 			status, notes, created_by
 		) VALUES (
-			:id, :company_id, :contract_id, :name, :start_date, :end_date,
-			:status, :notes, :created_by
+			$1,$2,$3,$4,$5,$6,
+			$7,$8,$9
 		)
-	`, p)
-	return err
+	`, p.ID, p.CompanyID, p.ContractID, p.Name, p.StartDate, p.EndDate, p.Status, p.Notes, p.CreatedBy)
 }
 
 func (r *programRepo) GetProgramByID(ctx context.Context, id uuid.UUID) (*program.CompanyProgram, error) {
 	var p program.CompanyProgram
-	err := r.db.GetContext(ctx, &p, `SELECT * FROM company_programs WHERE id = $1`, id)
+	err := rawGet(ctx, r.db, &p, `SELECT * FROM company_programs WHERE id = $1`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -44,18 +43,17 @@ func (r *programRepo) GetProgramByID(ctx context.Context, id uuid.UUID) (*progra
 }
 
 func (r *programRepo) UpdateProgram(ctx context.Context, p *program.CompanyProgram) error {
-	_, err := r.db.NamedExecContext(ctx, `
+	return rawExec(ctx, r.db, `
 		UPDATE company_programs SET
-			name = :name,
-			start_date = :start_date,
-			end_date = :end_date,
-			status = :status,
-			notes = :notes,
+			name = $1,
+			start_date = $2,
+			end_date = $3,
+			status = $4,
+			notes = $5,
 			updated_at = NOW(),
-			updated_by = :updated_by
-		WHERE id = :id
-	`, p)
-	return err
+			updated_by = $6
+		WHERE id = $7
+	`, p.Name, p.StartDate, p.EndDate, p.Status, p.Notes, p.UpdatedBy, p.ID)
 }
 
 func (r *programRepo) ListPrograms(ctx context.Context, f program.Filter, limit, offset int) ([]*program.CompanyProgram, int64, error) {
@@ -91,35 +89,36 @@ func (r *programRepo) ListPrograms(ctx context.Context, f program.Filter, limit,
 
 	whereClause := strings.Join(where, " AND ")
 
-	var total int64
-	if err := r.db.GetContext(ctx, &total, `SELECT COUNT(*) FROM company_programs WHERE `+whereClause, args...); err != nil {
+	var totalRow struct {
+		Count int64 `gorm:"column:count"`
+	}
+	if err := rawGet(ctx, r.db, &totalRow, `SELECT COUNT(*) AS count FROM company_programs WHERE `+whereClause, args...); err != nil {
 		return nil, 0, err
 	}
 
 	args = append(args, limit, offset)
 	rows := []*program.CompanyProgram{}
-	if err := r.db.SelectContext(ctx, &rows,
+	if err := rawSelectPtr(ctx, r.db, &rows,
 		fmt.Sprintf(`SELECT * FROM company_programs WHERE %s ORDER BY start_date DESC LIMIT $%d OFFSET $%d`, whereClause, idx, idx+1),
-		args...,
-	); err != nil {
+		args...); err != nil {
 		return nil, 0, err
 	}
 
-	return rows, total, nil
+	return rows, totalRow.Count, nil
 }
 
 func (r *programRepo) CreateScheduleRules(ctx context.Context, rules []*program.ScheduleRule) error {
 	for _, rule := range rules {
-		_, err := r.db.NamedExecContext(ctx, `
+		if err := rawExec(ctx, r.db, `
 			INSERT INTO company_program_schedule_rules (
 				id, program_id, weekday, start_time, duration_minutes,
 				frequency_interval_weeks, max_occurrences, service_type_id, worker_id, created_by
 			) VALUES (
-				:id, :program_id, :weekday, :start_time, :duration_minutes,
-				:frequency_interval_weeks, :max_occurrences, :service_type_id, :worker_id, :created_by
+				$1,$2,$3,$4,$5,
+				$6,$7,$8,$9,$10
 			)
-		`, rule)
-		if err != nil {
+		`, rule.ID, rule.ProgramID, rule.Weekday, rule.StartTime, rule.DurationMinutes,
+			rule.FrequencyIntervalWeeks, rule.MaxOccurrences, rule.ServiceTypeID, rule.WorkerID, rule.CreatedBy); err != nil {
 			return err
 		}
 	}
@@ -128,8 +127,20 @@ func (r *programRepo) CreateScheduleRules(ctx context.Context, rules []*program.
 
 func (r *programRepo) ListScheduleRules(ctx context.Context, programID uuid.UUID) ([]*program.ScheduleRule, error) {
 	rows := []*program.ScheduleRule{}
-	err := r.db.SelectContext(ctx, &rows, `
-		SELECT * FROM company_program_schedule_rules
+	err := rawSelectPtr(ctx, r.db, &rows, `
+		SELECT
+			id,
+			program_id,
+			weekday,
+			TO_CHAR(start_time, 'HH24:MI') AS start_time,
+			duration_minutes,
+			frequency_interval_weeks,
+			max_occurrences,
+			service_type_id,
+			worker_id,
+			created_at,
+			created_by
+		FROM company_program_schedule_rules
 		WHERE program_id = $1
 		ORDER BY weekday, start_time
 	`, programID)
@@ -137,44 +148,40 @@ func (r *programRepo) ListScheduleRules(ctx context.Context, programID uuid.UUID
 }
 
 func (r *programRepo) ReplaceScheduleRules(ctx context.Context, programID uuid.UUID, rules []*program.ScheduleRule) error {
-	tx, err := r.db.BeginTxx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM company_program_schedule_rules WHERE program_id = $1`, programID); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	for _, rule := range rules {
-		_, err := tx.NamedExecContext(ctx, `
-			INSERT INTO company_program_schedule_rules (
-				id, program_id, weekday, start_time, duration_minutes,
-				frequency_interval_weeks, max_occurrences, service_type_id, worker_id, created_by
-			) VALUES (
-				:id, :program_id, :weekday, :start_time, :duration_minutes,
-				:frequency_interval_weeks, :max_occurrences, :service_type_id, :worker_id, :created_by
-			)
-		`, rule)
-		if err != nil {
-			_ = tx.Rollback()
+	return withTx(ctx, r.db, func(tx *gorm.DB) error {
+		if err := rawExec(ctx, tx, `DELETE FROM company_program_schedule_rules WHERE program_id = $1`, programID); err != nil {
 			return err
 		}
-	}
-	return tx.Commit()
+		for _, rule := range rules {
+			if err := rawExec(ctx, tx, `
+				INSERT INTO company_program_schedule_rules (
+					id, program_id, weekday, start_time, duration_minutes,
+					frequency_interval_weeks, max_occurrences, service_type_id, worker_id, created_by
+				) VALUES (
+					$1,$2,$3,$4,$5,
+					$6,$7,$8,$9,$10
+				)
+			`, rule.ID, rule.ProgramID, rule.Weekday, rule.StartTime, rule.DurationMinutes,
+				rule.FrequencyIntervalWeeks, rule.MaxOccurrences, rule.ServiceTypeID, rule.WorkerID, rule.CreatedBy); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func (r *programRepo) CreateAgendaServices(ctx context.Context, services []*program.AgendaService) error {
 	for _, service := range services {
-		_, err := r.db.NamedExecContext(ctx, `
+		if err := rawExec(ctx, r.db, `
 			INSERT INTO agenda_services (
 				id, agenda_id, service_type_id, worker_id, planned_start_time,
 				planned_duration_minutes, status, notes
 			) VALUES (
-				:id, :agenda_id, :service_type_id, :worker_id, :planned_start_time,
-				:planned_duration_minutes, :status, :notes
+				$1,$2,$3,$4,$5,
+				$6,$7,$8
 			)
-		`, service)
-		if err != nil {
+		`, service.ID, service.AgendaID, service.ServiceTypeID, service.WorkerID, service.PlannedStartTime,
+			service.PlannedDurationMinutes, service.Status, service.Notes); err != nil {
 			return err
 		}
 	}
@@ -183,8 +190,21 @@ func (r *programRepo) CreateAgendaServices(ctx context.Context, services []*prog
 
 func (r *programRepo) ListAgendaServices(ctx context.Context, agendaID uuid.UUID) ([]*program.AgendaService, error) {
 	rows := []*program.AgendaService{}
-	err := r.db.SelectContext(ctx, &rows, `
-		SELECT * FROM agenda_services
+	err := rawSelectPtr(ctx, r.db, &rows, `
+		SELECT
+			id,
+			agenda_id,
+			service_type_id,
+			worker_id,
+			TO_CHAR(planned_start_time, 'HH24:MI') AS planned_start_time,
+			planned_duration_minutes,
+			status,
+			notes,
+			completed_at,
+			completed_by,
+			created_at,
+			updated_at
+		FROM agenda_services
 		WHERE agenda_id = $1
 		ORDER BY planned_start_time NULLS LAST, created_at ASC
 	`, agendaID)
@@ -193,7 +213,7 @@ func (r *programRepo) ListAgendaServices(ctx context.Context, agendaID uuid.UUID
 
 func (r *programRepo) GetAgendaServiceByID(ctx context.Context, id uuid.UUID) (*program.AgendaService, error) {
 	var row program.AgendaService
-	err := r.db.GetContext(ctx, &row, `SELECT * FROM agenda_services WHERE id = $1`, id)
+	err := rawGet(ctx, r.db, &row, `SELECT * FROM agenda_services WHERE id = $1`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -202,7 +222,7 @@ func (r *programRepo) GetAgendaServiceByID(ctx context.Context, id uuid.UUID) (*
 
 func (r *programRepo) GetAgendaContextByServiceID(ctx context.Context, agendaServiceID uuid.UUID) (*program.AgendaServiceContext, error) {
 	var row program.AgendaServiceContext
-	err := r.db.GetContext(ctx, &row, `
+	err := rawGet(ctx, r.db, &row, `
 		SELECT a.id AS agenda_id, a.company_id, a.scheduled_date, a.scheduled_start
 		FROM agenda_services s
 		JOIN agendas a ON a.id = s.agenda_id
@@ -214,20 +234,32 @@ func (r *programRepo) GetAgendaContextByServiceID(ctx context.Context, agendaSer
 	return &row, nil
 }
 
+func (r *programRepo) GetAgendaContextByAgendaID(ctx context.Context, agendaID uuid.UUID) (*program.AgendaServiceContext, error) {
+	var row program.AgendaServiceContext
+	err := rawGet(ctx, r.db, &row, `
+		SELECT id AS agenda_id, company_id, scheduled_date, TO_CHAR(scheduled_start, 'HH24:MI') AS scheduled_start
+		FROM agendas
+		WHERE id = $1
+	`, agendaID)
+	if err != nil {
+		return nil, err
+	}
+	return &row, nil
+}
+
 func (r *programRepo) UpdateAgendaService(ctx context.Context, service *program.AgendaService) error {
-	_, err := r.db.NamedExecContext(ctx, `
+	return rawExec(ctx, r.db, `
 		UPDATE agenda_services SET
-			worker_id = :worker_id,
-			planned_start_time = :planned_start_time,
-			planned_duration_minutes = :planned_duration_minutes,
-			status = :status,
-			notes = :notes,
-			completed_at = :completed_at,
-			completed_by = :completed_by,
+			worker_id = $1,
+			planned_start_time = $2,
+			planned_duration_minutes = $3,
+			status = $4,
+			notes = $5,
+			completed_at = $6,
+			completed_by = $7,
 			updated_at = NOW()
-		WHERE id = :id
-	`, service)
-	return err
+		WHERE id = $8
+	`, service.WorkerID, service.PlannedStartTime, service.PlannedDurationMinutes, service.Status, service.Notes, service.CompletedAt, service.CompletedBy, service.ID)
 }
 
 func (r *programRepo) UpsertParticipants(ctx context.Context, participants []*program.AgendaServiceParticipant) error {
@@ -236,18 +268,17 @@ func (r *programRepo) UpsertParticipants(ctx context.Context, participants []*pr
 			now := time.Now()
 			p.AttendedAt = &now
 		}
-		_, err := r.db.NamedExecContext(ctx, `
+		if err := rawExec(ctx, r.db, `
 			INSERT INTO agenda_service_participants (
 				id, agenda_service_id, patient_id, attended, attended_at, notes, created_by
 			) VALUES (
-				:id, :agenda_service_id, :patient_id, :attended, :attended_at, :notes, :created_by
+				$1,$2,$3,$4,$5,$6,$7
 			)
 			ON CONFLICT (agenda_service_id, patient_id) DO UPDATE SET
 				attended = EXCLUDED.attended,
 				attended_at = EXCLUDED.attended_at,
 				notes = EXCLUDED.notes
-		`, p)
-		if err != nil {
+		`, p.ID, p.AgendaServiceID, p.PatientID, p.Attended, p.AttendedAt, p.Notes, p.CreatedBy); err != nil {
 			return err
 		}
 	}
@@ -256,7 +287,7 @@ func (r *programRepo) UpsertParticipants(ctx context.Context, participants []*pr
 
 func (r *programRepo) ListParticipants(ctx context.Context, agendaServiceID uuid.UUID) ([]*program.AgendaServiceParticipant, error) {
 	rows := []*program.AgendaServiceParticipant{}
-	err := r.db.SelectContext(ctx, &rows, `
+	err := rawSelectPtr(ctx, r.db, &rows, `
 		SELECT * FROM agenda_service_participants
 		WHERE agenda_service_id = $1
 		ORDER BY created_at ASC
@@ -269,49 +300,43 @@ func (r *programRepo) PatientIDsOutsideAgendaCompany(ctx context.Context, agenda
 		return nil, nil
 	}
 
-	ctxRow := r.db.QueryRowxContext(ctx, `
+	var ctxRow struct {
+		CompanyID uuid.UUID `gorm:"column:company_id"`
+	}
+	if err := rawGet(ctx, r.db, &ctxRow, `
 		SELECT a.company_id
 		FROM agenda_services s
 		JOIN agendas a ON a.id = s.agenda_id
 		WHERE s.id = $1
-	`, agendaServiceID)
-
-	var companyID uuid.UUID
-	if err := ctxRow.Scan(&companyID); err != nil {
+	`, agendaServiceID); err != nil {
 		if err == sql.ErrNoRows {
 			return patientIDs, nil
 		}
 		return nil, err
 	}
 
-	args := []interface{}{companyID}
-	placeholders := make([]string, 0, len(patientIDs))
-	for i, id := range patientIDs {
-		args = append(args, id)
-		placeholders = append(placeholders, fmt.Sprintf("$%d", i+2))
+	type row struct {
+		ID uuid.UUID `gorm:"column:id"`
 	}
-
-	query := `
+	var rows []row
+	if err := r.db.WithContext(ctx).Raw(`
 		SELECT p.id
 		FROM patients p
-		WHERE p.id IN (` + strings.Join(placeholders, ",") + `)
+		WHERE p.id IN ?
 		AND EXISTS (
 			SELECT 1
 			FROM patient_companies pc
 			WHERE pc.patient_id = p.id
-			AND pc.company_id = $1
+			AND pc.company_id = ?
 			AND pc.is_active = true
 		)
-	`
-
-	var valid []uuid.UUID
-	if err := r.db.SelectContext(ctx, &valid, query, args...); err != nil {
+	`, patientIDs, ctxRow.CompanyID).Scan(&rows).Error; err != nil {
 		return nil, err
 	}
 
-	validSet := make(map[uuid.UUID]struct{}, len(valid))
-	for _, id := range valid {
-		validSet[id] = struct{}{}
+	validSet := make(map[uuid.UUID]struct{}, len(rows))
+	for _, row := range rows {
+		validSet[row.ID] = struct{}{}
 	}
 
 	missing := make([]uuid.UUID, 0)
@@ -325,17 +350,16 @@ func (r *programRepo) PatientIDsOutsideAgendaCompany(ctx context.Context, agenda
 }
 
 func (r *programRepo) LinkProgramAgenda(ctx context.Context, programID, agendaID uuid.UUID) error {
-	_, err := r.db.ExecContext(ctx, `
+	return rawExec(ctx, r.db, `
 		INSERT INTO company_program_agendas (program_id, agenda_id)
 		VALUES ($1, $2)
 		ON CONFLICT (program_id, agenda_id) DO NOTHING
 	`, programID, agendaID)
-	return err
 }
 
 func (r *programRepo) ListParticipantsDetail(ctx context.Context, agendaServiceID uuid.UUID) ([]*program.ParticipantDetail, error) {
 	rows := []*program.ParticipantDetail{}
-	err := r.db.SelectContext(ctx, &rows, `
+	err := rawSelectPtr(ctx, r.db, &rows, `
 		SELECT
 			asp.*,
 			p.first_name || ' ' || p.last_name AS patient_name
@@ -347,16 +371,20 @@ func (r *programRepo) ListParticipantsDetail(ctx context.Context, agendaServiceI
 	return rows, err
 }
 
-func (r *programRepo) ListProgramAgendas(ctx context.Context, programID uuid.UUID) ([]*program.AgendaWithServices, error) { // 1. Get agendas linked to the program
+func (r *programRepo) ListProgramAgendas(ctx context.Context, programID uuid.UUID) ([]*program.AgendaWithServices, error) {
 	type agendaRow struct {
-		AgendaID       uuid.UUID `db:"agenda_id"`
-		ScheduledDate  time.Time `db:"scheduled_date"`
-		ScheduledStart *string   `db:"scheduled_start"`
-		Status         string    `db:"status"`
+		AgendaID       uuid.UUID `gorm:"column:agenda_id"`
+		ScheduledDate  time.Time `gorm:"column:scheduled_date"`
+		ScheduledStart *string   `gorm:"column:scheduled_start"`
+		Status         string    `gorm:"column:status"`
 	}
 	var aRows []agendaRow
-	if err := r.db.SelectContext(ctx, &aRows, `
-		SELECT a.id AS agenda_id, a.scheduled_date, a.scheduled_start, a.status
+	if err := rawSelect(ctx, r.db, &aRows, `
+		SELECT
+			a.id AS agenda_id,
+			a.scheduled_date,
+			TO_CHAR(a.scheduled_start, 'HH24:MI') AS scheduled_start,
+			a.status
 		FROM agendas a
 		JOIN company_program_agendas cpa ON cpa.agenda_id = a.id
 		WHERE cpa.program_id = $1
@@ -385,31 +413,34 @@ func (r *programRepo) ListProgramAgendas(ctx context.Context, programID uuid.UUI
 		return result, nil
 	}
 
-	// 2. Load services for all those agendas in one query
-	placeholders := make([]string, len(agendaIDs))
-	args := make([]interface{}, len(agendaIDs))
-	for i, id := range agendaIDs {
-		placeholders[i] = fmt.Sprintf("$%d", i+1)
-		args[i] = id
-	}
-
 	type svcRow struct {
 		program.AgendaService
-		ServiceTypeName *string `db:"service_type_name"`
-		WorkerName      *string `db:"worker_name"`
+		ServiceTypeName *string `gorm:"column:service_type_name"`
+		WorkerName      *string `gorm:"column:worker_name"`
 	}
 	var svcRows []svcRow
-	if err := r.db.SelectContext(ctx, &svcRows, `
+	if err := r.db.WithContext(ctx).Raw(`
 		SELECT
-			s.*,
+			s.id,
+			s.agenda_id,
+			s.service_type_id,
+			s.worker_id,
+			TO_CHAR(s.planned_start_time, 'HH24:MI') AS planned_start_time,
+			s.planned_duration_minutes,
+			s.status,
+			s.notes,
+			s.completed_at,
+			s.completed_by,
+			s.created_at,
+			s.updated_at,
 			st.name AS service_type_name,
 			w.first_name || ' ' || w.last_name AS worker_name
 		FROM agenda_services s
 		JOIN service_types st ON st.id = s.service_type_id
 		LEFT JOIN amaur_workers w ON w.id = s.worker_id
-		WHERE s.agenda_id IN (`+strings.Join(placeholders, ",")+`)
+		WHERE s.agenda_id IN ?
 		ORDER BY s.agenda_id, s.planned_start_time NULLS LAST, s.created_at
-	`, args...); err != nil {
+	`, agendaIDs).Scan(&svcRows).Error; err != nil {
 		return nil, err
 	}
 
@@ -430,7 +461,7 @@ func (r *programRepo) ListProgramAgendas(ctx context.Context, programID uuid.UUI
 
 func (r *programRepo) CreateAgenda(ctx context.Context, companyID uuid.UUID, contractID *uuid.UUID, scheduledDate time.Time, scheduledStart *string, byUserID uuid.UUID) (uuid.UUID, error) {
 	id := uuid.New()
-	_, err := r.db.ExecContext(ctx, `
+	err := rawExec(ctx, r.db, `
 		INSERT INTO agendas (id, company_id, contract_id, status, scheduled_date, scheduled_start, created_by)
 		VALUES ($1, $2, $3, 'scheduled', $4, $5, $6)
 	`, id, companyID, contractID, scheduledDate, scheduledStart, byUserID)
@@ -440,12 +471,111 @@ func (r *programRepo) CreateAgenda(ctx context.Context, companyID uuid.UUID, con
 	return id, nil
 }
 
-// ListAgendaServicesByWorker returns agenda_services assigned to a worker where the
-// agenda's scheduled_date falls within [from, to), including the date on the service.
+func (r *programRepo) ListCompanyPatientIDs(ctx context.Context, companyID uuid.UUID) ([]uuid.UUID, error) {
+	type row struct {
+		ID uuid.UUID `gorm:"column:id"`
+	}
+	var rows []row
+	err := rawSelect(ctx, r.db, &rows, `
+		SELECT p.id
+		FROM patient_companies pc
+		JOIN patients p ON p.id = pc.patient_id
+		WHERE pc.company_id = $1
+		  AND pc.is_active = true
+		  AND p.deleted_at IS NULL
+		ORDER BY p.first_name, p.last_name
+	`, companyID)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]uuid.UUID, 0, len(rows))
+	for _, row := range rows {
+		ids = append(ids, row.ID)
+	}
+	return ids, nil
+}
+
+func (r *programRepo) HasWorkerScheduleConflict(ctx context.Context, workerID uuid.UUID, scheduledDate time.Time, startTime string, durationMinutes int, excludeAgendaServiceID *uuid.UUID) (bool, error) {
+	if durationMinutes <= 0 {
+		durationMinutes = 60
+	}
+
+	normalized := normalizeClockString(startTime)
+	start, err := time.Parse("15:04", normalized)
+	if err != nil {
+		return false, err
+	}
+	scheduledStart := time.Date(
+		scheduledDate.Year(),
+		scheduledDate.Month(),
+		scheduledDate.Day(),
+		start.Hour(),
+		start.Minute(),
+		0,
+		0,
+		time.UTC,
+	)
+
+	var excluded sql.NullString
+	if excludeAgendaServiceID != nil {
+		excluded.Valid = true
+		excluded.String = excludeAgendaServiceID.String()
+	}
+
+	query := `
+		SELECT EXISTS (
+			SELECT 1
+			FROM agenda_services s
+			JOIN agendas a ON a.id = s.agenda_id
+			WHERE s.worker_id = $1
+			  AND s.status IN ('planned', 'completed')
+			  AND a.scheduled_date = $2::date
+			  AND (a.scheduled_date + COALESCE(s.planned_start_time, a.scheduled_start)) < $3 + ($4 * INTERVAL '1 minute')
+			  AND (a.scheduled_date + COALESCE(s.planned_start_time, a.scheduled_start) + (COALESCE(s.planned_duration_minutes, 60) * INTERVAL '1 minute')) > $3
+			  AND ($5::uuid IS NULL OR s.id <> $5)
+		) AS exists
+	`
+
+	var row struct {
+		Exists bool `gorm:"column:exists"`
+	}
+	if err := rawGet(ctx, r.db, &row, query, workerID, scheduledDate, scheduledStart, durationMinutes, excluded); err != nil {
+		return false, err
+	}
+	return row.Exists, nil
+}
+
+func normalizeClockString(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	if t, err := time.Parse("15:04:05", raw); err == nil {
+		return t.Format("15:04")
+	}
+	if t, err := time.Parse("15:04", raw); err == nil {
+		return t.Format("15:04")
+	}
+	return raw
+}
+
 func (r *programRepo) ListAgendaServicesByWorker(ctx context.Context, workerID uuid.UUID, from, to time.Time) ([]*program.AgendaServiceWithDate, error) {
 	rows := []*program.AgendaServiceWithDate{}
-	err := r.db.SelectContext(ctx, &rows, `
-		SELECT s.*, a.scheduled_date, st.name AS service_type_name
+	err := rawSelectPtr(ctx, r.db, &rows, `
+		SELECT
+			s.id,
+			s.agenda_id,
+			s.service_type_id,
+			s.worker_id,
+			TO_CHAR(s.planned_start_time, 'HH24:MI') AS planned_start_time,
+			s.planned_duration_minutes,
+			s.status,
+			s.notes,
+			s.completed_at,
+			s.completed_by,
+			s.created_at,
+			s.updated_at,
+			a.scheduled_date,
+			st.name AS service_type_name
 		FROM agenda_services s
 		JOIN agendas a ON a.id = s.agenda_id
 		JOIN service_types st ON st.id = s.service_type_id

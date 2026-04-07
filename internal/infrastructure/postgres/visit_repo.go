@@ -9,14 +9,14 @@ import (
 	"amaur/api/internal/domain/visit"
 
 	"github.com/google/uuid"
-	"github.com/jmoiron/sqlx"
+	"gorm.io/gorm"
 )
 
 type visitRepo struct {
-	db *sqlx.DB
+	db *gorm.DB
 }
 
-func NewVisitRepository(db *sqlx.DB) visit.Repository {
+func NewVisitRepository(db *gorm.DB) visit.Repository {
 	return &visitRepo{db: db}
 }
 
@@ -24,20 +24,19 @@ func (r *visitRepo) Create(ctx context.Context, v *visit.Visit) error {
 	v.ID = uuid.New()
 	now := time.Now()
 	v.CreatedAt = now
-	_, err := r.db.NamedExecContext(ctx, `
+	return rawExec(ctx, r.db, `
 		INSERT INTO visits (id, company_id, branch_id, contract_id, status,
 			scheduled_date, scheduled_start, scheduled_end,
 			coordinator_user_id, general_notes, created_at, created_by)
-		VALUES (:id, :company_id, :branch_id, :contract_id, :status,
-			:scheduled_date, :scheduled_start, :scheduled_end,
-			:coordinator_user_id, :general_notes, :created_at, :created_by)
-	`, v)
-	return err
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+	`, v.ID, v.CompanyID, v.BranchID, v.ContractID, v.Status,
+		v.ScheduledDate, v.ScheduledStart, v.ScheduledEnd,
+		v.CoordinatorUserID, v.GeneralNotes, v.CreatedAt, v.CreatedBy)
 }
 
 func (r *visitRepo) FindByID(ctx context.Context, id uuid.UUID) (*visit.Visit, error) {
 	v := &visit.Visit{}
-	err := r.db.GetContext(ctx, v, `
+	err := rawGet(ctx, r.db, v, `
 		SELECT v.*, c.name AS company_name, c.fantasy_name AS company_fantasy_name
 		FROM visits v
 		JOIN companies c ON c.id = v.company_id
@@ -51,22 +50,25 @@ func (r *visitRepo) FindByID(ctx context.Context, id uuid.UUID) (*visit.Visit, e
 func (r *visitRepo) Update(ctx context.Context, v *visit.Visit) error {
 	now := time.Now()
 	v.UpdatedAt = &now
-	_, err := r.db.NamedExecContext(ctx, `
+	return rawExec(ctx, r.db, `
 		UPDATE visits SET
-			status=:status, scheduled_date=:scheduled_date,
-			scheduled_start=:scheduled_start, scheduled_end=:scheduled_end,
-			actual_start=:actual_start, actual_end=:actual_end,
-			coordinator_user_id=:coordinator_user_id, general_notes=:general_notes,
-			cancellation_reason=:cancellation_reason, internal_report=:internal_report,
-			updated_at=:updated_at, updated_by=:updated_by
-		WHERE id=:id
-	`, v)
-	return err
+			status=$1, scheduled_date=$2,
+			scheduled_start=$3, scheduled_end=$4,
+			actual_start=$5, actual_end=$6,
+			coordinator_user_id=$7, general_notes=$8,
+			cancellation_reason=$9, internal_report=$10,
+			updated_at=$11, updated_by=$12
+		WHERE id=$13
+	`, v.Status, v.ScheduledDate,
+		v.ScheduledStart, v.ScheduledEnd,
+		v.ActualStart, v.ActualEnd,
+		v.CoordinatorUserID, v.GeneralNotes,
+		v.CancellationReason, v.InternalReport,
+		v.UpdatedAt, v.UpdatedBy, v.ID)
 }
 
 func (r *visitRepo) Delete(ctx context.Context, id uuid.UUID) error {
-	_, err := r.db.ExecContext(ctx, `DELETE FROM visits WHERE id=$1`, id)
-	return err
+	return rawExec(ctx, r.db, `DELETE FROM visits WHERE id=$1`, id)
 }
 
 func (r *visitRepo) List(ctx context.Context, f visit.Filter, limit, offset int) ([]*visit.Visit, int64, error) {
@@ -102,16 +104,17 @@ func (r *visitRepo) List(ctx context.Context, f visit.Filter, limit, offset int)
 
 	clause := strings.Join(where, " AND ")
 
-	var total int64
-	if err := r.db.GetContext(ctx, &total,
-		`SELECT COUNT(*) FROM visits v JOIN companies c ON c.id = v.company_id WHERE `+clause, args...); err != nil {
+	var totalRow struct {
+		Count int64 `gorm:"column:count"`
+	}
+	if err := rawGet(ctx, r.db, &totalRow,
+		`SELECT COUNT(*) AS count FROM visits v JOIN companies c ON c.id = v.company_id WHERE `+clause, args...); err != nil {
 		return nil, 0, err
 	}
 
 	args = append(args, limit, offset)
 	rows := []*visit.Visit{}
-	if err := r.db.SelectContext(ctx, &rows,
-		fmt.Sprintf(`
+	if err := rawSelectPtr(ctx, r.db, &rows, fmt.Sprintf(`
 			SELECT v.*, c.name AS company_name, c.fantasy_name AS company_fantasy_name
 			FROM visits v
 			JOIN companies c ON c.id = v.company_id
@@ -120,30 +123,26 @@ func (r *visitRepo) List(ctx context.Context, f visit.Filter, limit, offset int)
 		return nil, 0, err
 	}
 
-	return rows, total, nil
+	return rows, totalRow.Count, nil
 }
 
 func (r *visitRepo) AssignWorkers(ctx context.Context, visitID uuid.UUID, workerIDs []uuid.UUID) error {
-	tx, err := r.db.BeginTxx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM visit_workers WHERE visit_id=$1`, visitID); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	for _, wid := range workerIDs {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO visit_workers (visit_id, worker_id, role_in_visit) VALUES ($1,$2,'profesional') ON CONFLICT DO NOTHING`, visitID, wid); err != nil {
-			_ = tx.Rollback()
+	return withTx(ctx, r.db, func(tx *gorm.DB) error {
+		if err := rawExec(ctx, tx, `DELETE FROM visit_workers WHERE visit_id=$1`, visitID); err != nil {
 			return err
 		}
-	}
-	return tx.Commit()
+		for _, wid := range workerIDs {
+			if err := rawExec(ctx, tx, `INSERT INTO visit_workers (visit_id, worker_id, role_in_visit) VALUES ($1,$2,'profesional') ON CONFLICT DO NOTHING`, visitID, wid); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func (r *visitRepo) ListWorkers(ctx context.Context, visitID uuid.UUID) ([]*visit.VisitWorker, error) {
 	rows := []*visit.VisitWorker{}
-	err := r.db.SelectContext(ctx, &rows, `
+	err := rawSelectPtr(ctx, r.db, &rows, `
 		SELECT vw.visit_id, vw.worker_id, vw.role_in_visit,
 			w.first_name, w.last_name, w.role_title
 		FROM visit_workers vw
@@ -153,9 +152,11 @@ func (r *visitRepo) ListWorkers(ctx context.Context, visitID uuid.UUID) ([]*visi
 }
 
 func (r *visitRepo) HasPatientParticipation(ctx context.Context, visitID, patientID uuid.UUID) (bool, error) {
-	var exists bool
-	err := r.db.GetContext(ctx, &exists,
-		`SELECT EXISTS (SELECT 1 FROM care_sessions WHERE visit_id = $1 AND patient_id = $2)`,
+	var row struct {
+		Exists bool `gorm:"column:exists"`
+	}
+	err := rawGet(ctx, r.db, &row,
+		`SELECT EXISTS (SELECT 1 FROM care_sessions WHERE visit_id = $1 AND patient_id = $2) AS exists`,
 		visitID, patientID)
-	return exists, err
+	return row.Exists, err
 }

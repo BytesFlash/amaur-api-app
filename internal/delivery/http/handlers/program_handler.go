@@ -153,6 +153,10 @@ func (h *ProgramHandler) CreateAgendaService(w http.ResponseWriter, r *http.Requ
 
 	item, err := h.svc.CreateAgendaService(r.Context(), req)
 	if err != nil {
+		if errors.Is(err, appprogram.ErrWorkerScheduleConflict) {
+			response.Conflict(w, "WORKER_BUSY", err.Error())
+			return
+		}
 		response.InternalError(w)
 		return
 	}

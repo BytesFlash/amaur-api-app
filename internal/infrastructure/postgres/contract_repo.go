@@ -9,14 +9,14 @@ import (
 	"amaur/api/internal/domain/contract"
 
 	"github.com/google/uuid"
-	"github.com/jmoiron/sqlx"
+	"gorm.io/gorm"
 )
 
 type contractRepo struct {
-	db *sqlx.DB
+	db *gorm.DB
 }
 
-func NewContractRepository(db *sqlx.DB) contract.Repository {
+func NewContractRepository(db *gorm.DB) contract.Repository {
 	return &contractRepo{db: db}
 }
 
@@ -24,20 +24,19 @@ func (r *contractRepo) Create(ctx context.Context, c *contract.Contract) error {
 	c.ID = uuid.New()
 	now := time.Now()
 	c.CreatedAt = now
-	_, err := r.db.NamedExecContext(ctx, `
+	return rawExec(ctx, r.db, `
 		INSERT INTO contracts (id, company_id, name, contract_type, status,
 			start_date, end_date, renewal_date, value_clp, billing_cycle,
 			notes, signed_document_url, created_at, created_by)
-		VALUES (:id, :company_id, :name, :contract_type, :status,
-			:start_date, :end_date, :renewal_date, :value_clp, :billing_cycle,
-			:notes, :signed_document_url, :created_at, :created_by)
-	`, c)
-	return err
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+	`, c.ID, c.CompanyID, c.Name, c.ContractType, c.Status,
+		c.StartDate, c.EndDate, c.RenewalDate, c.ValueCLP, c.BillingCycle,
+		c.Notes, c.SignedDocumentURL, c.CreatedAt, c.CreatedBy)
 }
 
 func (r *contractRepo) FindByID(ctx context.Context, id uuid.UUID) (*contract.Contract, error) {
 	c := &contract.Contract{}
-	err := r.db.GetContext(ctx, c, `SELECT * FROM contracts WHERE id=$1`, id)
+	err := rawGet(ctx, r.db, c, `SELECT * FROM contracts WHERE id=$1`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -47,21 +46,22 @@ func (r *contractRepo) FindByID(ctx context.Context, id uuid.UUID) (*contract.Co
 func (r *contractRepo) Update(ctx context.Context, c *contract.Contract) error {
 	now := time.Now()
 	c.UpdatedAt = &now
-	_, err := r.db.NamedExecContext(ctx, `
+	return rawExec(ctx, r.db, `
 		UPDATE contracts SET
-			name=:name, contract_type=:contract_type, status=:status,
-			start_date=:start_date, end_date=:end_date, renewal_date=:renewal_date,
-			value_clp=:value_clp, billing_cycle=:billing_cycle, notes=:notes,
-			signed_document_url=:signed_document_url,
-			updated_at=:updated_at, updated_by=:updated_by
-		WHERE id=:id
-	`, c)
-	return err
+			name=$1, contract_type=$2, status=$3,
+			start_date=$4, end_date=$5, renewal_date=$6,
+			value_clp=$7, billing_cycle=$8, notes=$9,
+			signed_document_url=$10,
+			updated_at=$11, updated_by=$12
+		WHERE id=$13
+	`, c.Name, c.ContractType, c.Status,
+		c.StartDate, c.EndDate, c.RenewalDate,
+		c.ValueCLP, c.BillingCycle, c.Notes,
+		c.SignedDocumentURL, c.UpdatedAt, c.UpdatedBy, c.ID)
 }
 
 func (r *contractRepo) Delete(ctx context.Context, id uuid.UUID) error {
-	_, err := r.db.ExecContext(ctx, `DELETE FROM contracts WHERE id=$1`, id)
-	return err
+	return rawExec(ctx, r.db, `DELETE FROM contracts WHERE id=$1`, id)
 }
 
 func (r *contractRepo) List(ctx context.Context, f contract.Filter, limit, offset int) ([]*contract.Contract, int64, error) {
@@ -82,24 +82,26 @@ func (r *contractRepo) List(ctx context.Context, f contract.Filter, limit, offse
 
 	clause := strings.Join(where, " AND ")
 
-	var total int64
-	if err := r.db.GetContext(ctx, &total, `SELECT COUNT(*) FROM contracts WHERE `+clause, args...); err != nil {
+	var totalRow struct {
+		Count int64 `gorm:"column:count"`
+	}
+	if err := rawGet(ctx, r.db, &totalRow, `SELECT COUNT(*) AS count FROM contracts WHERE `+clause, args...); err != nil {
 		return nil, 0, err
 	}
 
 	args = append(args, limit, offset)
 	rows := []*contract.Contract{}
-	if err := r.db.SelectContext(ctx, &rows,
+	if err := rawSelectPtr(ctx, r.db, &rows,
 		fmt.Sprintf(`SELECT * FROM contracts WHERE %s ORDER BY created_at DESC LIMIT $%d OFFSET $%d`, clause, idx, idx+1),
 		args...); err != nil {
 		return nil, 0, err
 	}
 
-	return rows, total, nil
+	return rows, totalRow.Count, nil
 }
 
 func (r *contractRepo) ListServices(ctx context.Context, contractID uuid.UUID) ([]*contract.ContractService, error) {
 	rows := []*contract.ContractService{}
-	err := r.db.SelectContext(ctx, &rows, `SELECT * FROM contract_services WHERE contract_id=$1`, contractID)
+	err := rawSelectPtr(ctx, r.db, &rows, `SELECT * FROM contract_services WHERE contract_id=$1`, contractID)
 	return rows, err
 }

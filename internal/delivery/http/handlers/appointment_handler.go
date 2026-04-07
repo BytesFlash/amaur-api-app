@@ -69,6 +69,8 @@ func (h *AppointmentHandler) Create(w http.ResponseWriter, r *http.Request) {
 			response.BadRequest(w, "INVALID_DATE", err.Error())
 		case errors.Is(err, appappt.ErrInvalidRecurrence):
 			response.BadRequest(w, "INVALID_RECURRENCE", err.Error())
+		case errors.Is(err, appappt.ErrWorkerBusy):
+			response.Conflict(w, "WORKER_BUSY", err.Error())
 		default:
 			response.InternalError(w)
 		}
@@ -107,6 +109,10 @@ func (h *AppointmentHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, appappt.ErrNotFound) {
 			response.NotFound(w, "APPOINTMENT_NOT_FOUND", "Appointment not found")
+			return
+		}
+		if errors.Is(err, appappt.ErrWorkerBusy) {
+			response.Conflict(w, "WORKER_BUSY", err.Error())
 			return
 		}
 		response.InternalError(w)

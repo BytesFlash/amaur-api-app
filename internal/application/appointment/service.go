@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"amaur/api/internal/domain/appointment"
+	"amaur/api/internal/domain/program"
 
 	"github.com/google/uuid"
 )
@@ -14,6 +15,7 @@ var (
 	ErrNotFound          = errors.New("appointment not found")
 	ErrInvalidDate       = errors.New("invalid scheduled_at date/time")
 	ErrInvalidRecurrence = errors.New("session_count must be between 1 and 52")
+	ErrWorkerBusy        = errors.New("worker already has another booking in this time block")
 )
 
 type CreateAppointmentRequest struct {
@@ -39,11 +41,17 @@ type UpdateAppointmentRequest struct {
 }
 
 type Service struct {
-	repo appointment.Repository
+	repo        appointment.Repository
+	programRepo program.Repository
 }
 
 func NewService(repo appointment.Repository) *Service {
 	return &Service{repo: repo}
+}
+
+func (s *Service) WithProgramRepo(r program.Repository) *Service {
+	s.programRepo = r
+	return s
 }
 
 // Create creates one or more appointments (recurring if SessionCount > 1).
@@ -75,6 +83,32 @@ func (s *Service) Create(ctx context.Context, req CreateAppointmentRequest, by u
 	batch := make([]*appointment.Appointment, 0, count)
 	for i := 0; i < count; i++ {
 		scheduledAt := first.AddDate(0, 0, i*freqWeeks*7)
+		if req.WorkerID != nil {
+			duration := coalesceDuration(req.DurationMinutes)
+			occupied, err := s.repo.HasWorkerConflict(ctx, *req.WorkerID, scheduledAt, duration, nil)
+			if err != nil {
+				return nil, err
+			}
+			if occupied {
+				return nil, ErrWorkerBusy
+			}
+			if s.programRepo != nil {
+				groupOccupied, err := s.programRepo.HasWorkerScheduleConflict(
+					ctx,
+					*req.WorkerID,
+					scheduledAt,
+					scheduledAt.Format("15:04"),
+					duration,
+					nil,
+				)
+				if err != nil {
+					return nil, err
+				}
+				if groupOccupied {
+					return nil, ErrWorkerBusy
+				}
+			}
+		}
 		batch = append(batch, &appointment.Appointment{
 			ID:               uuid.New(),
 			PatientID:        req.PatientID,
@@ -132,6 +166,32 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, req UpdateAppointmen
 	if req.Notes != nil {
 		a.Notes = req.Notes
 	}
+	if a.WorkerID != nil {
+		duration := coalesceDuration(a.DurationMinutes)
+		occupied, err := s.repo.HasWorkerConflict(ctx, *a.WorkerID, a.ScheduledAt, duration, &a.ID)
+		if err != nil {
+			return nil, err
+		}
+		if occupied {
+			return nil, ErrWorkerBusy
+		}
+		if s.programRepo != nil {
+			groupOccupied, err := s.programRepo.HasWorkerScheduleConflict(
+				ctx,
+				*a.WorkerID,
+				a.ScheduledAt,
+				a.ScheduledAt.Format("15:04"),
+				duration,
+				nil,
+			)
+			if err != nil {
+				return nil, err
+			}
+			if groupOccupied {
+				return nil, ErrWorkerBusy
+			}
+		}
+	}
 	a.UpdatedAt = &now
 	if err := s.repo.Update(ctx, a); err != nil {
 		return nil, err
@@ -184,4 +244,11 @@ func parseScheduledAt(s string) (time.Time, error) {
 		}
 	}
 	return time.Time{}, errors.New("invalid date format")
+}
+
+func coalesceDuration(duration *int) int {
+	if duration != nil && *duration > 0 {
+		return *duration
+	}
+	return 60
 }

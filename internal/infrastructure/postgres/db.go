@@ -2,14 +2,15 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"strings"
 	"time"
 
-	"github.com/jmoiron/sqlx"
-	_ "github.com/lib/pq"
+	gormpg "gorm.io/driver/postgres"
+	"gorm.io/gorm"
 )
 
-func Connect(dsn string) (*sqlx.DB, error) {
+func Connect(dsn string) (*gorm.DB, error) {
 	// Append timezone parameter so TIMESTAMPTZ values are returned in Chile local time.
 	// This keeps displayed hours aligned with what the user entered regardless of server TZ.
 	if !strings.Contains(dsn, "TimeZone=") && !strings.Contains(dsn, "timezone=") {
@@ -19,22 +20,32 @@ func Connect(dsn string) (*sqlx.DB, error) {
 		}
 		dsn += sep + "TimeZone=America%2FSantiago"
 	}
-	db, err := sqlx.Open("postgres", dsn)
+
+	db, err := gorm.Open(gormpg.Open(dsn), &gorm.Config{})
 	if err != nil {
 		return nil, err
 	}
 
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(10)
-	db.SetConnMaxLifetime(5 * time.Minute)
-	db.SetConnMaxIdleTime(2 * time.Minute)
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, err
+	}
+
+	sqlDB.SetMaxOpenConns(25)
+	sqlDB.SetMaxIdleConns(10)
+	sqlDB.SetConnMaxLifetime(5 * time.Minute)
+	sqlDB.SetConnMaxIdleTime(2 * time.Minute)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := db.PingContext(ctx); err != nil {
+	if err := sqlDB.PingContext(ctx); err != nil {
 		return nil, err
 	}
 
 	return db, nil
+}
+
+func sqlDB(db *gorm.DB) (*sql.DB, error) {
+	return db.DB()
 }

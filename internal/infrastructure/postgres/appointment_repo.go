@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 	"time"
@@ -9,14 +10,14 @@ import (
 	"amaur/api/internal/domain/appointment"
 
 	"github.com/google/uuid"
-	"github.com/jmoiron/sqlx"
+	"gorm.io/gorm"
 )
 
 type appointmentRepo struct {
-	db *sqlx.DB
+	db *gorm.DB
 }
 
-func NewAppointmentRepository(db *sqlx.DB) appointment.Repository {
+func NewAppointmentRepository(db *gorm.DB) appointment.Repository {
 	return &appointmentRepo{db: db}
 }
 
@@ -32,16 +33,16 @@ const appointmentSelectSQL = `
 	JOIN service_types st ON st.id = a.service_type_id`
 
 func (r *appointmentRepo) Create(ctx context.Context, a *appointment.Appointment) error {
-	query := `
+	return rawExec(ctx, r.db, `
 		INSERT INTO appointments (
 			id, patient_id, worker_id, service_type_id, company_id,
 			recurring_group_id, scheduled_at, duration_minutes, status, notes, created_by
 		) VALUES (
-			:id, :patient_id, :worker_id, :service_type_id, :company_id,
-			:recurring_group_id, :scheduled_at, :duration_minutes, :status, :notes, :created_by
-		)`
-	_, err := r.db.NamedExecContext(ctx, query, a)
-	return err
+			$1,$2,$3,$4,$5,
+			$6,$7,$8,$9,$10,$11
+		)`,
+		a.ID, a.PatientID, a.WorkerID, a.ServiceTypeID, a.CompanyID,
+		a.RecurringGroupID, a.ScheduledAt, a.DurationMinutes, a.Status, a.Notes, a.CreatedBy)
 }
 
 func (r *appointmentRepo) CreateBatch(ctx context.Context, batch []*appointment.Appointment) error {
@@ -66,13 +67,12 @@ func (r *appointmentRepo) CreateBatch(ctx context.Context, batch []*appointment.
 			a.RecurringGroupID, a.ScheduledAt, a.DurationMinutes, a.Status, a.Notes, a.CreatedBy,
 		)
 	}
-	_, err := r.db.ExecContext(ctx, query+strings.Join(vals, ","), args...)
-	return err
+	return rawExec(ctx, r.db, query+strings.Join(vals, ","), args...)
 }
 
 func (r *appointmentRepo) FindByID(ctx context.Context, id uuid.UUID) (*appointment.Appointment, error) {
 	var a appointment.Appointment
-	err := r.db.GetContext(ctx, &a, appointmentSelectSQL+` WHERE a.id = $1`, id)
+	err := rawGet(ctx, r.db, &a, appointmentSelectSQL+` WHERE a.id = $1`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -80,23 +80,21 @@ func (r *appointmentRepo) FindByID(ctx context.Context, id uuid.UUID) (*appointm
 }
 
 func (r *appointmentRepo) Update(ctx context.Context, a *appointment.Appointment) error {
-	_, err := r.db.NamedExecContext(ctx, `
+	return rawExec(ctx, r.db, `
 		UPDATE appointments SET
-			worker_id        = :worker_id,
-			service_type_id  = :service_type_id,
-			company_id       = :company_id,
-			scheduled_at     = :scheduled_at,
-			duration_minutes = :duration_minutes,
-			status           = :status,
-			notes            = :notes,
+			worker_id        = $1,
+			service_type_id  = $2,
+			company_id       = $3,
+			scheduled_at     = $4,
+			duration_minutes = $5,
+			status           = $6,
+			notes            = $7,
 			updated_at       = NOW()
-		WHERE id = :id`, a)
-	return err
+		WHERE id = $8`, a.WorkerID, a.ServiceTypeID, a.CompanyID, a.ScheduledAt, a.DurationMinutes, a.Status, a.Notes, a.ID)
 }
 
 func (r *appointmentRepo) Delete(ctx context.Context, id uuid.UUID) error {
-	_, err := r.db.ExecContext(ctx, `DELETE FROM appointments WHERE id = $1`, id)
-	return err
+	return rawExec(ctx, r.db, `DELETE FROM appointments WHERE id = $1`, id)
 }
 
 func (r *appointmentRepo) List(ctx context.Context, f appointment.Filter, limit, offset int) ([]*appointment.Appointment, int64, error) {
@@ -137,9 +135,11 @@ func (r *appointmentRepo) List(ctx context.Context, f appointment.Filter, limit,
 
 	whereClause := strings.Join(where, " AND ")
 
-	var total int64
-	countSQL := `SELECT COUNT(*) FROM appointments a JOIN patients p ON p.id = a.patient_id LEFT JOIN amaur_workers w ON w.id = a.worker_id JOIN service_types st ON st.id = a.service_type_id WHERE ` + whereClause
-	if err := r.db.QueryRowContext(ctx, countSQL, args...).Scan(&total); err != nil {
+	var totalRow struct {
+		Count int64 `gorm:"column:count"`
+	}
+	countSQL := `SELECT COUNT(*) AS count FROM appointments a JOIN patients p ON p.id = a.patient_id LEFT JOIN amaur_workers w ON w.id = a.worker_id JOIN service_types st ON st.id = a.service_type_id WHERE ` + whereClause
+	if err := rawGet(ctx, r.db, &totalRow, countSQL, args...); err != nil {
 		return nil, 0, err
 	}
 
@@ -147,19 +147,39 @@ func (r *appointmentRepo) List(ctx context.Context, f appointment.Filter, limit,
 	listSQL := appointmentSelectSQL + ` WHERE ` + whereClause +
 		fmt.Sprintf(` ORDER BY a.scheduled_at DESC LIMIT $%d OFFSET $%d`, idx, idx+1)
 
-	rows, err := r.db.QueryxContext(ctx, listSQL, args...)
-	if err != nil {
+	var items []*appointment.Appointment
+	if err := rawSelectPtr(ctx, r.db, &items, listSQL, args...); err != nil {
 		return nil, 0, err
 	}
-	defer rows.Close()
+	return items, totalRow.Count, nil
+}
 
-	var items []*appointment.Appointment
-	for rows.Next() {
-		var a appointment.Appointment
-		if err := rows.StructScan(&a); err != nil {
-			return nil, 0, err
-		}
-		items = append(items, &a)
+func (r *appointmentRepo) HasWorkerConflict(ctx context.Context, workerID uuid.UUID, scheduledAt time.Time, durationMinutes int, excludeID *uuid.UUID) (bool, error) {
+	if durationMinutes <= 0 {
+		durationMinutes = 60
 	}
-	return items, total, rows.Err()
+
+	query := `
+		SELECT EXISTS (
+			SELECT 1
+			FROM appointments a
+			WHERE a.worker_id = $1
+			  AND a.status IN ('requested', 'confirmed', 'completed')
+			  AND a.scheduled_at < $2 + ($3 * INTERVAL '1 minute')
+			  AND a.scheduled_at + (COALESCE(a.duration_minutes, 60) * INTERVAL '1 minute') > $2
+			  AND ($4::uuid IS NULL OR a.id <> $4)
+		) AS exists
+	`
+
+	var excluded sql.NullString
+	if excludeID != nil {
+		excluded.Valid = true
+		excluded.String = excludeID.String()
+	}
+
+	var row struct {
+		Exists bool `gorm:"column:exists"`
+	}
+	err := rawGet(ctx, r.db, &row, query, workerID, scheduledAt, durationMinutes, excluded)
+	return row.Exists, err
 }

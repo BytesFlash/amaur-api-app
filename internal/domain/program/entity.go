@@ -137,6 +137,7 @@ type Repository interface {
 	ListAgendaServices(ctx context.Context, agendaID uuid.UUID) ([]*AgendaService, error)
 	GetAgendaServiceByID(ctx context.Context, id uuid.UUID) (*AgendaService, error)
 	GetAgendaContextByServiceID(ctx context.Context, agendaServiceID uuid.UUID) (*AgendaServiceContext, error)
+	GetAgendaContextByAgendaID(ctx context.Context, agendaID uuid.UUID) (*AgendaServiceContext, error)
 	UpdateAgendaService(ctx context.Context, service *AgendaService) error
 
 	UpsertParticipants(ctx context.Context, participants []*AgendaServiceParticipant) error
@@ -150,4 +151,6 @@ type Repository interface {
 	CreateAgenda(ctx context.Context, companyID uuid.UUID, contractID *uuid.UUID, scheduledDate time.Time, scheduledStart *string, byUserID uuid.UUID) (uuid.UUID, error)
 	// ListAgendaServicesByWorker returns agenda services assigned to a worker within [from, to).
 	ListAgendaServicesByWorker(ctx context.Context, workerID uuid.UUID, from, to time.Time) ([]*AgendaServiceWithDate, error)
+	ListCompanyPatientIDs(ctx context.Context, companyID uuid.UUID) ([]uuid.UUID, error)
+	HasWorkerScheduleConflict(ctx context.Context, workerID uuid.UUID, scheduledDate time.Time, startTime string, durationMinutes int, excludeAgendaServiceID *uuid.UUID) (bool, error)
 }

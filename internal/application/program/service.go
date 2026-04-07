@@ -3,6 +3,7 @@ package program
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"amaur/api/internal/domain/caresession"
@@ -21,6 +22,7 @@ var (
 	ErrAgendaServiceNotFound       = errors.New("agenda service not found")
 	ErrParticipantsOutsideCompany  = errors.New("one or more participants are not associated to agenda company")
 	ErrAgendaServiceWorkerRequired = errors.New("agenda service must have a worker assigned before completion")
+	ErrWorkerScheduleConflict      = errors.New("worker already has another booking in this time block")
 )
 
 type ScheduleRuleInput struct {
@@ -96,8 +98,11 @@ func (s *Service) CreateProgram(ctx context.Context, req CreateProgramRequest, c
 	if endDate != nil && startDate.After(*endDate) {
 		return nil, ErrInvalidDateRange
 	}
-	if !dateRangeWithinContract(startDate, endDate, ct.StartDate, ct.EndDate) {
+	if !programStartWithinContract(startDate, ct.StartDate, ct.EndDate) {
 		return nil, ErrOutsideContractRange
+	}
+	if err := validateRuleOccurrencesWithinContract(startDate, endDate, ct.StartDate, ct.EndDate, req.Rules); err != nil {
+		return nil, err
 	}
 
 	status := program.StatusDraft
@@ -183,8 +188,36 @@ func (s *Service) UpdateProgram(ctx context.Context, id uuid.UUID, req UpdatePro
 	if endDate != nil && startDate.After(*endDate) {
 		return nil, ErrInvalidDateRange
 	}
-	if !dateRangeWithinContract(startDate, endDate, ct.StartDate, ct.EndDate) {
+	if !programStartWithinContract(startDate, ct.StartDate, ct.EndDate) {
 		return nil, ErrOutsideContractRange
+	}
+
+	rulesToValidate := req.Rules
+	if rulesToValidate == nil {
+		currentRules, err := s.repo.ListScheduleRules(ctx, p.ID)
+		if err != nil {
+			return nil, err
+		}
+		if len(currentRules) > 0 {
+			cloned := make([]ScheduleRuleInput, 0, len(currentRules))
+			for _, rule := range currentRules {
+				cloned = append(cloned, ScheduleRuleInput{
+					Weekday:                rule.Weekday,
+					StartTime:              rule.StartTime,
+					DurationMinutes:        rule.DurationMinutes,
+					FrequencyIntervalWeeks: rule.FrequencyIntervalWeeks,
+					MaxOccurrences:         rule.MaxOccurrences,
+					ServiceTypeID:          rule.ServiceTypeID,
+					WorkerID:               rule.WorkerID,
+				})
+			}
+			rulesToValidate = &cloned
+		}
+	}
+	if rulesToValidate != nil {
+		if err := validateRuleOccurrencesWithinContract(startDate, endDate, ct.StartDate, ct.EndDate, *rulesToValidate); err != nil {
+			return nil, err
+		}
 	}
 
 	if req.Name != nil {
@@ -260,6 +293,29 @@ func (s *Service) ListPrograms(ctx context.Context, companyIDStr, contractIDStr,
 }
 
 func (s *Service) CreateAgendaService(ctx context.Context, req CreateAgendaServiceRequest) (*program.AgendaService, error) {
+	if req.WorkerID != nil {
+		ctxData, err := s.repo.GetAgendaContextByAgendaID(ctx, req.AgendaID)
+		if err != nil {
+			return nil, err
+		}
+		startTime := req.PlannedStartTime
+		if startTime == nil || *startTime == "" {
+			startTime = ctxData.ScheduledStart
+		}
+		duration := 60
+		if req.PlannedDurationMinutes != nil && *req.PlannedDurationMinutes > 0 {
+			duration = *req.PlannedDurationMinutes
+		}
+		if startTime != nil && *startTime != "" {
+			conflict, err := s.repo.HasWorkerScheduleConflict(ctx, *req.WorkerID, ctxData.ScheduledDate, *startTime, duration, nil)
+			if err != nil {
+				return nil, err
+			}
+			if conflict {
+				return nil, ErrWorkerScheduleConflict
+			}
+		}
+	}
 	svc := &program.AgendaService{
 		ID:                     uuid.New(),
 		AgendaID:               req.AgendaID,
@@ -271,6 +327,9 @@ func (s *Service) CreateAgendaService(ctx context.Context, req CreateAgendaServi
 		Notes:                  req.Notes,
 	}
 	if err := s.repo.CreateAgendaServices(ctx, []*program.AgendaService{svc}); err != nil {
+		return nil, err
+	}
+	if err := s.seedCompanyParticipants(ctx, svc.ID, nil); err != nil {
 		return nil, err
 	}
 	return svc, nil
@@ -395,7 +454,7 @@ func parseDatePtr(s *string) *time.Time {
 	return &t
 }
 
-func dateRangeWithinContract(programStart time.Time, programEnd *time.Time, contractStart time.Time, contractEnd *time.Time) bool {
+func programStartWithinContract(programStart time.Time, contractStart time.Time, contractEnd *time.Time) bool {
 	if programStart.Before(contractStart) {
 		return false
 	}
@@ -405,10 +464,56 @@ func dateRangeWithinContract(programStart time.Time, programEnd *time.Time, cont
 	if programStart.After(*contractEnd) {
 		return false
 	}
-	if programEnd != nil && programEnd.After(*contractEnd) {
-		return false
-	}
 	return true
+}
+
+func validateRuleOccurrencesWithinContract(programStart time.Time, programEnd *time.Time, contractStart time.Time, contractEnd *time.Time, rules []ScheduleRuleInput) error {
+	if len(rules) == 0 {
+		return nil
+	}
+
+	windowStart := programStart
+	if windowStart.Before(contractStart) {
+		windowStart = contractStart
+	}
+
+	windowEnd := effectiveProgramWindowEnd(programEnd, contractEnd)
+	if windowEnd == nil {
+		return nil
+	}
+	if windowEnd.Before(windowStart) {
+		return fmt.Errorf("%w: la fecha final efectiva del programa queda fuera de la vigencia del contrato", ErrOutsideContractRange)
+	}
+
+	for _, rule := range rules {
+		dates := occurrences(
+			windowStart,
+			*windowEnd,
+			normalizeProgramWeekday(int(rule.Weekday)),
+			maxInt(rule.FrequencyIntervalWeeks, 1),
+			rule.MaxOccurrences,
+		)
+		if len(dates) > 0 {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("%w: las reglas configuradas no generan sesiones dentro de la vigencia del contrato", ErrOutsideContractRange)
+}
+
+func effectiveProgramWindowEnd(programEnd *time.Time, contractEnd *time.Time) *time.Time {
+	switch {
+	case programEnd == nil && contractEnd == nil:
+		return nil
+	case programEnd == nil:
+		return contractEnd
+	case contractEnd == nil:
+		return programEnd
+	case programEnd.Before(*contractEnd):
+		return programEnd
+	default:
+		return contractEnd
+	}
 }
 
 func maxInt(v int, fallback int) int {
@@ -454,18 +559,82 @@ func (s *Service) GenerateAgendas(ctx context.Context, programID uuid.UUID, by u
 		endDate = &d
 	}
 
+	ct, err := s.contractRepo.FindByID(ctx, p.ContractID)
+	if err != nil {
+		return 0, nil, ErrContractNotFound
+	}
+	if clippedEnd := effectiveProgramWindowEnd(endDate, ct.EndDate); clippedEnd != nil {
+		endDate = clippedEnd
+	}
+	if endDate != nil && endDate.Before(p.StartDate) {
+		return 0, []uuid.UUID{}, nil
+	}
+
+	existingAgendas, err := s.repo.ListProgramAgendas(ctx, p.ID)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	agendaBySlot := make(map[string]uuid.UUID, len(existingAgendas))
+	serviceByAgenda := make(map[uuid.UUID]map[string]uuid.UUID, len(existingAgendas))
+	for _, agenda := range existingAgendas {
+		key := agendaSlotKey(agenda.ScheduledDate, agenda.ScheduledStart)
+		agendaBySlot[key] = agenda.AgendaID
+
+		if _, ok := serviceByAgenda[agenda.AgendaID]; !ok {
+			serviceByAgenda[agenda.AgendaID] = make(map[string]uuid.UUID)
+		}
+		for _, svc := range agenda.Services {
+			serviceByAgenda[agenda.AgendaID][agendaServiceKey(
+				svc.ServiceTypeID,
+				svc.WorkerID,
+				svc.PlannedStartTime,
+				svc.PlannedDurationMinutes,
+			)] = svc.ID
+		}
+	}
+
 	var created []uuid.UUID
 	for _, rule := range rules {
-		dates := occurrences(p.StartDate, *endDate, int(rule.Weekday), rule.FrequencyIntervalWeeks)
+		weekday := normalizeProgramWeekday(int(rule.Weekday))
+		dates := occurrences(
+			p.StartDate,
+			*endDate,
+			weekday,
+			rule.FrequencyIntervalWeeks,
+			rule.MaxOccurrences,
+		)
 		for _, date := range dates {
-			startStr := rule.StartTime
-			agendaID, err := s.repo.CreateAgenda(ctx, p.CompanyID, &p.ContractID, date, &startStr, by)
-			if err != nil {
-				continue // skip failures (e.g. duplicates)
-			}
-			_ = s.repo.LinkProgramAgenda(ctx, p.ID, agendaID)
+			startStr := normalizeClockString(rule.StartTime)
 			if rule.ServiceTypeID != nil {
 				workerID := rule.WorkerID
+				if workerID != nil {
+					conflict, err := s.repo.HasWorkerScheduleConflict(ctx, *workerID, date, startStr, rule.DurationMinutes, nil)
+					if err != nil || conflict {
+						continue
+					}
+				}
+
+				slotKey := agendaSlotKey(date, &startStr)
+				agendaID, ok := agendaBySlot[slotKey]
+				if !ok {
+					agendaID, err = s.repo.CreateAgenda(ctx, p.CompanyID, &p.ContractID, date, &startStr, by)
+					if err != nil {
+						continue // skip failures so other occurrences can still be generated
+					}
+					if err := s.repo.LinkProgramAgenda(ctx, p.ID, agendaID); err != nil {
+						continue
+					}
+					agendaBySlot[slotKey] = agendaID
+					serviceByAgenda[agendaID] = make(map[string]uuid.UUID)
+					created = append(created, agendaID)
+				}
+
+				signature := agendaServiceKey(*rule.ServiceTypeID, workerID, &startStr, &rule.DurationMinutes)
+				if existingServiceID, exists := serviceByAgenda[agendaID][signature]; exists {
+					_ = s.seedCompanyParticipants(ctx, existingServiceID, nil)
+					continue
+				}
 				svc := &program.AgendaService{
 					ID:                     uuid.New(),
 					AgendaID:               agendaID,
@@ -475,18 +644,66 @@ func (s *Service) GenerateAgendas(ctx context.Context, programID uuid.UUID, by u
 					PlannedDurationMinutes: &rule.DurationMinutes,
 					Status:                 program.AgendaServicePlanned,
 				}
-				_ = s.repo.CreateAgendaServices(ctx, []*program.AgendaService{svc})
+				if err := s.repo.CreateAgendaServices(ctx, []*program.AgendaService{svc}); err == nil {
+					_ = s.seedCompanyParticipants(ctx, svc.ID, nil)
+					serviceByAgenda[agendaID][signature] = svc.ID
+				}
+				continue
 			}
+
+			slotKey := agendaSlotKey(date, &startStr)
+			if _, ok := agendaBySlot[slotKey]; ok {
+				continue
+			}
+			agendaID, err := s.repo.CreateAgenda(ctx, p.CompanyID, &p.ContractID, date, &startStr, by)
+			if err != nil {
+				continue
+			}
+			if err := s.repo.LinkProgramAgenda(ctx, p.ID, agendaID); err != nil {
+				continue
+			}
+			agendaBySlot[slotKey] = agendaID
+			serviceByAgenda[agendaID] = make(map[string]uuid.UUID)
 			created = append(created, agendaID)
 		}
 	}
 	return len(created), created, nil
 }
 
+func (s *Service) seedCompanyParticipants(ctx context.Context, agendaServiceID uuid.UUID, createdBy *uuid.UUID) error {
+	ctxData, err := s.repo.GetAgendaContextByServiceID(ctx, agendaServiceID)
+	if err != nil {
+		return err
+	}
+	patientIDs, err := s.repo.ListCompanyPatientIDs(ctx, ctxData.CompanyID)
+	if err != nil {
+		return err
+	}
+	if len(patientIDs) == 0 {
+		return nil
+	}
+
+	items := make([]*program.AgendaServiceParticipant, 0, len(patientIDs))
+	for _, patientID := range patientIDs {
+		items = append(items, &program.AgendaServiceParticipant{
+			ID:              uuid.New(),
+			AgendaServiceID: agendaServiceID,
+			PatientID:       patientID,
+			Attended:        false,
+			CreatedBy:       createdBy,
+		})
+	}
+	return s.repo.UpsertParticipants(ctx, items)
+}
+
 // occurrences returns all dates matching weekday (0=Sun) from start to end, stepping by freqWeeks weeks.
-func occurrences(start, end time.Time, weekday, freqWeeks int) []time.Time {
+func occurrences(start, end time.Time, weekday, freqWeeks int, maxOccurrences *int) []time.Time {
 	if freqWeeks < 1 {
 		freqWeeks = 1
+	}
+	limit := -1
+	if maxOccurrences != nil && *maxOccurrences > 0 {
+		limit = *maxOccurrences
 	}
 	// Find first occurrence of weekday on or after start
 	cur := start
@@ -496,7 +713,58 @@ func occurrences(start, end time.Time, weekday, freqWeeks int) []time.Time {
 	var result []time.Time
 	for !cur.After(end) {
 		result = append(result, cur)
+		if limit > 0 && len(result) >= limit {
+			break
+		}
 		cur = cur.AddDate(0, 0, freqWeeks*7)
 	}
 	return result
+}
+
+func normalizeProgramWeekday(weekday int) int {
+	switch {
+	case weekday >= 0 && weekday <= 6:
+		return weekday
+	case weekday == 7:
+		return 0
+	default:
+		return ((weekday % 7) + 7) % 7
+	}
+}
+
+func normalizeClockString(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	if t, err := time.Parse("15:04:05", raw); err == nil {
+		return t.Format("15:04")
+	}
+	if t, err := time.Parse("15:04", raw); err == nil {
+		return t.Format("15:04")
+	}
+	return raw
+}
+
+func agendaSlotKey(date time.Time, start *string) string {
+	startValue := ""
+	if start != nil {
+		startValue = normalizeClockString(*start)
+	}
+	return fmt.Sprintf("%s|%s", date.Format("2006-01-02"), startValue)
+}
+
+func agendaServiceKey(serviceTypeID uuid.UUID, workerID *uuid.UUID, start *string, duration *int) string {
+	workerValue := ""
+	if workerID != nil {
+		workerValue = workerID.String()
+	}
+	startValue := ""
+	if start != nil {
+		startValue = normalizeClockString(*start)
+	}
+	durationValue := 0
+	if duration != nil {
+		durationValue = *duration
+	}
+	return fmt.Sprintf("%s|%s|%s|%d", serviceTypeID.String(), workerValue, startValue, durationValue)
 }

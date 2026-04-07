@@ -9,38 +9,40 @@ import (
 	"amaur/api/internal/domain/caresession"
 
 	"github.com/google/uuid"
-	"github.com/jmoiron/sqlx"
+	"gorm.io/gorm"
 )
 
 type careSessionRepo struct {
-	db *sqlx.DB
+	db *gorm.DB
 }
 
-func NewCareSessionRepository(db *sqlx.DB) caresession.Repository {
+func NewCareSessionRepository(db *gorm.DB) caresession.Repository {
 	return &careSessionRepo{db: db}
 }
 
 func (r *careSessionRepo) Create(ctx context.Context, cs *caresession.CareSession) error {
 	cs.ID = uuid.New()
 	cs.CreatedAt = time.Now()
-	_, err := r.db.NamedExecContext(ctx, `
+	return rawExec(ctx, r.db, `
 		INSERT INTO care_sessions (
 			id, visit_id, patient_id, worker_id, service_type_id, company_id,
 			contract_service_id, session_type, session_date, session_time,
 			duration_minutes, status, chief_complaint, subjective, objective,
 			assessment, plan, notes, follow_up_required, created_at, created_by
 		) VALUES (
-			:id, :visit_id, :patient_id, :worker_id, :service_type_id, :company_id,
-			:contract_service_id, :session_type, :session_date, :session_time,
-			:duration_minutes, :status, :chief_complaint, :subjective, :objective,
-			:assessment, :plan, :notes, :follow_up_required, :created_at, :created_by
-		)`, cs)
-	return err
+			$1,$2,$3,$4,$5,$6,
+			$7,$8,$9,$10,
+			$11,$12,$13,$14,$15,
+			$16,$17,$18,$19,$20,$21
+		)`, cs.ID, cs.VisitID, cs.PatientID, cs.WorkerID, cs.ServiceTypeID, cs.CompanyID,
+		cs.ContractServiceID, cs.SessionType, cs.SessionDate, cs.SessionTime,
+		cs.DurationMinutes, cs.Status, cs.ChiefComplaint, cs.Subjective, cs.Objective,
+		cs.Assessment, cs.Plan, cs.Notes, cs.FollowUpRequired, cs.CreatedAt, cs.CreatedBy)
 }
 
 func (r *careSessionRepo) FindByID(ctx context.Context, id uuid.UUID) (*caresession.CareSession, error) {
 	var cs caresession.CareSession
-	err := r.db.GetContext(ctx, &cs, `
+	err := rawGet(ctx, r.db, &cs, `
 		SELECT cs.*,
 			p.first_name AS patient_first_name, p.last_name AS patient_last_name,
 			w.first_name AS worker_first_name, w.last_name AS worker_last_name,
@@ -61,21 +63,24 @@ func (r *careSessionRepo) FindByID(ctx context.Context, id uuid.UUID) (*caresess
 func (r *careSessionRepo) Update(ctx context.Context, cs *caresession.CareSession) error {
 	now := time.Now()
 	cs.UpdatedAt = &now
-	_, err := r.db.NamedExecContext(ctx, `
+	return rawExec(ctx, r.db, `
 		UPDATE care_sessions SET
-			status=:status, session_date=:session_date, session_time=:session_time,
-			duration_minutes=:duration_minutes, chief_complaint=:chief_complaint,
-			subjective=:subjective, objective=:objective, assessment=:assessment,
-			plan=:plan, notes=:notes, follow_up_required=:follow_up_required,
-			follow_up_status=:follow_up_status, follow_up_date=:follow_up_date,
-			follow_up_notes=:follow_up_notes, updated_at=:updated_at, updated_by=:updated_by
-		WHERE id=:id`, cs)
-	return err
+			status=$1, session_date=$2, session_time=$3,
+			duration_minutes=$4, chief_complaint=$5,
+			subjective=$6, objective=$7, assessment=$8,
+			plan=$9, notes=$10, follow_up_required=$11,
+			follow_up_status=$12, follow_up_date=$13,
+			follow_up_notes=$14, updated_at=$15, updated_by=$16
+		WHERE id=$17`, cs.Status, cs.SessionDate, cs.SessionTime,
+		cs.DurationMinutes, cs.ChiefComplaint,
+		cs.Subjective, cs.Objective, cs.Assessment,
+		cs.Plan, cs.Notes, cs.FollowUpRequired,
+		cs.FollowUpStatus, cs.FollowUpDate,
+		cs.FollowUpNotes, cs.UpdatedAt, cs.UpdatedBy, cs.ID)
 }
 
 func (r *careSessionRepo) Delete(ctx context.Context, id uuid.UUID) error {
-	_, err := r.db.ExecContext(ctx, `DELETE FROM care_sessions WHERE id=$1`, id)
-	return err
+	return rawExec(ctx, r.db, `DELETE FROM care_sessions WHERE id=$1`, id)
 }
 
 func (r *careSessionRepo) List(ctx context.Context, f caresession.Filter, limit, offset int) ([]*caresession.CareSession, int64, error) {
@@ -126,15 +131,16 @@ func (r *careSessionRepo) List(ctx context.Context, f caresession.Filter, limit,
 
 	clause := strings.Join(where, " AND ")
 
-	var total int64
-	if err := r.db.GetContext(ctx, &total, `
-		SELECT COUNT(*) FROM care_sessions cs WHERE `+clause, args...); err != nil {
+	var totalRow struct {
+		Count int64 `gorm:"column:count"`
+	}
+	if err := rawGet(ctx, r.db, &totalRow, `SELECT COUNT(*) AS count FROM care_sessions cs WHERE `+clause, args...); err != nil {
 		return nil, 0, err
 	}
 
 	args = append(args, limit, offset)
 	var rows []*caresession.CareSession
-	if err := r.db.SelectContext(ctx, &rows, fmt.Sprintf(`
+	if err := rawSelectPtr(ctx, r.db, &rows, fmt.Sprintf(`
 		SELECT cs.*,
 			p.first_name AS patient_first_name, p.last_name AS patient_last_name,
 			w.first_name AS worker_first_name, w.last_name AS worker_last_name,
@@ -151,26 +157,26 @@ func (r *careSessionRepo) List(ctx context.Context, f caresession.Filter, limit,
 		return nil, 0, err
 	}
 
-	return rows, total, nil
+	return rows, totalRow.Count, nil
 }
 
 func (r *careSessionRepo) CreateGroupSession(ctx context.Context, gs *caresession.GroupSession) error {
 	gs.ID = uuid.New()
 	gs.CreatedAt = time.Now()
-	_, err := r.db.NamedExecContext(ctx, `
+	return rawExec(ctx, r.db, `
 		INSERT INTO group_sessions (
 			id, visit_id, service_type_id, worker_id, attendee_count,
 			session_date, session_time, duration_minutes, notes, created_at, created_by
 		) VALUES (
-			:id, :visit_id, :service_type_id, :worker_id, :attendee_count,
-			:session_date, :session_time, :duration_minutes, :notes, :created_at, :created_by
-		)`, gs)
-	return err
+			$1,$2,$3,$4,$5,
+			$6,$7,$8,$9,$10,$11
+		)`, gs.ID, gs.VisitID, gs.ServiceTypeID, gs.WorkerID, gs.AttendeeCount,
+		gs.SessionDate, gs.SessionTime, gs.DurationMinutes, gs.Notes, gs.CreatedAt, gs.CreatedBy)
 }
 
 func (r *careSessionRepo) ListGroupSessions(ctx context.Context, visitID uuid.UUID) ([]*caresession.GroupSession, error) {
 	var rows []*caresession.GroupSession
-	err := r.db.SelectContext(ctx, &rows, `
+	err := rawSelectPtr(ctx, r.db, &rows, `
 		SELECT gs.*,
 			st.name AS service_type_name,
 			w.first_name AS worker_first_name, w.last_name AS worker_last_name

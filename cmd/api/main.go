@@ -30,7 +30,11 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to connect to database")
 	}
-	defer db.Close()
+	sqlDB, err := db.DB()
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to unwrap database connection")
+	}
+	defer sqlDB.Close()
 	log.Info().Msg("database connected")
 
 	// Migrations

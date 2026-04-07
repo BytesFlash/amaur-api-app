@@ -2,7 +2,6 @@ package postgres
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"strings"
 	"time"
@@ -10,60 +9,39 @@ import (
 	"amaur/api/internal/domain/patient"
 
 	"github.com/google/uuid"
-	"github.com/jmoiron/sqlx"
+	"gorm.io/gorm"
 )
 
-// dbx is satisfied by both *sqlx.DB and *sqlx.Tx, enabling the same
-// repository code to run inside or outside a transaction.
-type dbx interface {
-	GetContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error
-	SelectContext(ctx context.Context, dest interface{}, query string, args ...interface{}) error
-	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
-}
-
 type PatientRepository struct {
-	db   *sqlx.DB // used only to begin transactions
-	q    dbx      // active executor (db or tx)
-	inTx bool     // guards against nested InTx calls
+	db   *gorm.DB
+	q    *gorm.DB
+	inTx bool
 }
 
-func NewPatientRepository(db *sqlx.DB) *PatientRepository {
+func NewPatientRepository(db *gorm.DB) *PatientRepository {
 	return &PatientRepository{db: db, q: db}
 }
 
-func (r *PatientRepository) withTx(tx *sqlx.Tx) *PatientRepository {
+func (r *PatientRepository) withTx(tx *gorm.DB) *PatientRepository {
 	return &PatientRepository{db: r.db, q: tx, inTx: true}
 }
 
-// InTx executes fn inside a single database transaction.
-// If called on a repository that is already inside a transaction the
-// existing transaction is reused transparently.
 func (r *PatientRepository) InTx(ctx context.Context, fn func(patient.Repository) error) error {
 	if r.inTx {
 		return fn(r)
 	}
-	tx, err := r.db.BeginTxx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	if err := fn(r.withTx(tx)); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	return tx.Commit()
+	return withTx(ctx, r.db, func(tx *gorm.DB) error {
+		return fn(r.withTx(tx))
+	})
 }
-
-// ── has_login subquery ───────────────────────────────────────────────────────
 
 const hasLoginExpr = `EXISTS(
 	SELECT 1 FROM users u
 	WHERE u.patient_id = p.id AND u.deleted_at IS NULL
 ) AS has_login`
 
-// ── Core CRUD ────────────────────────────────────────────────────────────────
-
 func (r *PatientRepository) Create(ctx context.Context, p *patient.Patient) error {
-	_, err := r.q.ExecContext(ctx,
+	return rawExec(ctx, r.q,
 		`INSERT INTO patients
          (id, rut, first_name, last_name, birth_date, gender, email, phone, address, city, region,
           emergency_contact_name, emergency_contact_phone, general_notes,
@@ -72,12 +50,11 @@ func (r *PatientRepository) Create(ctx context.Context, p *patient.Patient) erro
 		p.ID, p.RUT, p.FirstName, p.LastName, p.BirthDate, p.Gender, p.Email, p.Phone,
 		p.Address, p.City, p.Region, p.EmergencyContactName, p.EmergencyContactPhone,
 		p.GeneralNotes, p.PatientType, p.Status, p.TutorID, p.CreatedAt, p.CreatedBy)
-	return err
 }
 
 func (r *PatientRepository) FindByID(ctx context.Context, id uuid.UUID) (*patient.Patient, error) {
 	p := &patient.Patient{}
-	err := r.q.GetContext(ctx, p,
+	err := rawGet(ctx, r.q, p,
 		`SELECT p.id, p.rut, p.first_name, p.last_name, p.birth_date, p.gender, p.email,
                 p.phone, p.address, p.city, p.region,
                 p.emergency_contact_name, p.emergency_contact_phone, p.general_notes,
@@ -91,7 +68,7 @@ func (r *PatientRepository) FindByID(ctx context.Context, id uuid.UUID) (*patien
 
 func (r *PatientRepository) FindByRUT(ctx context.Context, rut string) (*patient.Patient, error) {
 	p := &patient.Patient{}
-	err := r.q.GetContext(ctx, p,
+	err := rawGet(ctx, r.q, p,
 		`SELECT p.id, p.rut, p.first_name, p.last_name, p.status, p.patient_type,
                 p.tutor_id, p.created_at,
                 `+hasLoginExpr+`
@@ -101,7 +78,7 @@ func (r *PatientRepository) FindByRUT(ctx context.Context, rut string) (*patient
 }
 
 func (r *PatientRepository) Update(ctx context.Context, p *patient.Patient) error {
-	_, err := r.q.ExecContext(ctx,
+	return rawExec(ctx, r.q,
 		`UPDATE patients SET
          rut=$1, first_name=$2, last_name=$3, birth_date=$4, gender=$5, email=$6, phone=$7,
          address=$8, city=$9, region=$10, emergency_contact_name=$11, emergency_contact_phone=$12,
@@ -112,13 +89,10 @@ func (r *PatientRepository) Update(ctx context.Context, p *patient.Patient) erro
 		p.Address, p.City, p.Region, p.EmergencyContactName, p.EmergencyContactPhone,
 		p.GeneralNotes, p.PatientType, p.Status, p.TutorID,
 		p.UpdatedAt, p.UpdatedBy, p.ID)
-	return err
 }
 
 func (r *PatientRepository) SoftDelete(ctx context.Context, id uuid.UUID) error {
-	_, err := r.q.ExecContext(ctx,
-		`UPDATE patients SET deleted_at = NOW() WHERE id = $1`, id)
-	return err
+	return rawExec(ctx, r.q, `UPDATE patients SET deleted_at = NOW() WHERE id = $1`, id)
 }
 
 func (r *PatientRepository) List(ctx context.Context, f patient.Filter, limit, offset int) ([]*patient.Patient, int64, error) {
@@ -179,36 +153,30 @@ func (r *PatientRepository) List(ctx context.Context, f patient.Filter, limit, o
 	args = append(args, limit, offset)
 
 	var items []*patient.Patient
-	if err := r.q.SelectContext(ctx, &items, query, args...); err != nil {
+	if err := rawSelectPtr(ctx, r.q, &items, query, args...); err != nil {
 		return nil, 0, err
 	}
 
-	countQuery := fmt.Sprintf(`SELECT COUNT(*) FROM patients p %s`, whereClause)
-	var total int64
-	_ = r.q.GetContext(ctx, &total, countQuery, args[:len(args)-2]...)
+	countQuery := fmt.Sprintf(`SELECT COUNT(*) AS count FROM patients p %s`, whereClause)
+	var totalRow struct {
+		Count int64 `gorm:"column:count"`
+	}
+	_ = rawGet(ctx, r.q, &totalRow, countQuery, args[:len(args)-2]...)
 
-	return items, total, nil
+	return items, totalRow.Count, nil
 }
 
-// ── Company associations — FULL REPLACE ──────────────────────────────────────
-
-// ReplaceCompanies atomically replaces all company associations for a patient.
-// Delete + Insert run against the same executor (db or tx), so the caller
-// MUST call this inside InTx when other writes are also in flight.
 func (r *PatientRepository) ReplaceCompanies(ctx context.Context, patientID uuid.UUID, companies []*patient.PatientCompany) error {
-	_, err := r.q.ExecContext(ctx,
-		`DELETE FROM patient_companies WHERE patient_id = $1`, patientID)
-	if err != nil {
+	if err := rawExec(ctx, r.q, `DELETE FROM patient_companies WHERE patient_id = $1`, patientID); err != nil {
 		return err
 	}
 	for _, pc := range companies {
-		_, err := r.q.ExecContext(ctx,
+		if err := rawExec(ctx, r.q,
 			`INSERT INTO patient_companies
              (id, patient_id, company_id, position, department, is_active, start_date, notes, created_at, created_by)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
 			pc.ID, pc.PatientID, pc.CompanyID, pc.Position, pc.Department, pc.IsActive,
-			pc.StartDate, pc.Notes, pc.CreatedAt, pc.CreatedBy)
-		if err != nil {
+			pc.StartDate, pc.Notes, pc.CreatedAt, pc.CreatedBy); err != nil {
 			return err
 		}
 	}
@@ -217,7 +185,7 @@ func (r *PatientRepository) ReplaceCompanies(ctx context.Context, patientID uuid
 
 func (r *PatientRepository) ListPatientCompanies(ctx context.Context, patientID uuid.UUID) ([]*patient.PatientCompany, error) {
 	var items []*patient.PatientCompany
-	err := r.q.SelectContext(ctx, &items,
+	err := rawSelectPtr(ctx, r.q, &items,
 		`SELECT id, patient_id, company_id, position, department, is_active,
                 start_date, end_date, notes, created_at, created_by
          FROM patient_companies
@@ -226,12 +194,9 @@ func (r *PatientRepository) ListPatientCompanies(ctx context.Context, patientID 
 	return items, err
 }
 
-// ── Tutor ─────────────────────────────────────────────────────────────────────
-
-// ListByTutorID returns all patients whose tutor_id matches the given UUID.
 func (r *PatientRepository) ListByTutorID(ctx context.Context, tutorID uuid.UUID) ([]*patient.Patient, error) {
 	var items []*patient.Patient
-	err := r.q.SelectContext(ctx, &items,
+	err := rawSelectPtr(ctx, r.q, &items,
 		`SELECT p.id, p.rut, p.first_name, p.last_name, p.birth_date, p.status,
                 p.patient_type, p.tutor_id, p.created_at,
                 `+hasLoginExpr+`
@@ -241,36 +206,30 @@ func (r *PatientRepository) ListByTutorID(ctx context.Context, tutorID uuid.UUID
 	return items, err
 }
 
-// ── Login linkage ─────────────────────────────────────────────────────────────
-
-// GetLinkedUserID returns the ID of the active user account linked to the
-// given patient, or nil if no such account exists.
 func (r *PatientRepository) GetLinkedUserID(ctx context.Context, patientID uuid.UUID) (*uuid.UUID, error) {
-	var userID uuid.UUID
-	err := r.q.GetContext(ctx, &userID,
-		`SELECT id FROM users WHERE patient_id = $1 AND deleted_at IS NULL LIMIT 1`, patientID)
+	var row struct {
+		ID uuid.UUID `gorm:"column:id"`
+	}
+	err := rawGet(ctx, r.q, &row, `SELECT id FROM users WHERE patient_id = $1 AND deleted_at IS NULL LIMIT 1`, patientID)
 	if err != nil {
-		if err.Error() == "sql: no rows in result set" {
+		if isNotFound(err) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &userID, nil
+	return &row.ID, nil
 }
 
-// ── Clinical record ───────────────────────────────────────────────────────────
-
 func (r *PatientRepository) CreateClinicalRecord(ctx context.Context, cr *patient.ClinicalRecord) error {
-	_, err := r.q.ExecContext(ctx,
+	return rawExec(ctx, r.q,
 		`INSERT INTO clinical_records (id, patient_id, consent_signed, created_at, created_by)
          VALUES ($1,$2,$3,$4,$5)`,
 		cr.ID, cr.PatientID, cr.ConsentSigned, cr.CreatedAt, cr.CreatedBy)
-	return err
 }
 
 func (r *PatientRepository) GetClinicalRecord(ctx context.Context, patientID uuid.UUID) (*patient.ClinicalRecord, error) {
 	cr := &patient.ClinicalRecord{}
-	err := r.q.GetContext(ctx, cr,
+	err := rawGet(ctx, r.q, cr,
 		`SELECT cr.id, cr.patient_id, cr.main_diagnosis, cr.allergies, cr.current_medications, cr.relevant_history,
                 cr.family_history, cr.physical_restrictions, cr.alerts, cr.occupation,
                 cr.consent_signed, cr.consent_date, cr.consent_version,
@@ -285,7 +244,7 @@ func (r *PatientRepository) GetClinicalRecord(ctx context.Context, patientID uui
 }
 
 func (r *PatientRepository) UpdateClinicalRecord(ctx context.Context, cr *patient.ClinicalRecord) error {
-	_, err := r.q.ExecContext(ctx,
+	return rawExec(ctx, r.q,
 		`UPDATE clinical_records SET
          main_diagnosis=$1, allergies=$2, current_medications=$3, relevant_history=$4,
          family_history=$5, physical_restrictions=$6, alerts=$7, occupation=$8,
@@ -296,20 +255,18 @@ func (r *PatientRepository) UpdateClinicalRecord(ctx context.Context, cr *patien
 		cr.FamilyHistory, cr.PhysicalRestrictions, cr.Alerts, cr.Occupation,
 		cr.ConsentSigned, cr.ConsentDate, cr.ConsentVersion,
 		cr.UpdatedAt, cr.UpdatedBy, cr.PatientID)
-	return err
 }
 
-// AnotherPatientHasEmail returns true when the given email (case-insensitive) is
-// stored as the clinical contact email on any active patient OTHER than excludingPatientID.
-// This prevents reusing another patient's contact email as a login credential.
 func (r *PatientRepository) AnotherPatientHasEmail(ctx context.Context, email string, excludingPatientID uuid.UUID) (bool, error) {
-	var count int
-	err := r.q.GetContext(ctx, &count,
-		`SELECT COUNT(*) FROM patients
+	var row struct {
+		Count int `gorm:"column:count"`
+	}
+	err := rawGet(ctx, r.q, &row,
+		`SELECT COUNT(*) AS count FROM patients
          WHERE LOWER(TRIM(email)) = LOWER(TRIM($1))
            AND id <> $2
            AND deleted_at IS NULL
          LIMIT 1`,
 		email, excludingPatientID)
-	return count > 0, err
+	return row.Count > 0, err
 }

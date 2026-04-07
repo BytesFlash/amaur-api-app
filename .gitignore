@@ -1,0 +1,36 @@
+# Binaries
+/amaur-api
+/amaur-api.exe
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Coverage
+*.out
+coverage.html
+
+# Build output
+/bin/
+/dist/
+
+# Environment & secrets
+.env
+*.env.local
+
+# Air live-reload
+tmp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

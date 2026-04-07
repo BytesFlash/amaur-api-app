@@ -45,4 +45,5 @@ type Repository interface {
 	Update(ctx context.Context, a *Appointment) error
 	Delete(ctx context.Context, id uuid.UUID) error
 	List(ctx context.Context, f Filter, limit, offset int) ([]*Appointment, int64, error)
+	HasWorkerConflict(ctx context.Context, workerID uuid.UUID, scheduledAt time.Time, durationMinutes int, excludeID *uuid.UUID) (bool, error)
 }

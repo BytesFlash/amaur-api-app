@@ -24,11 +24,11 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
-	"github.com/jmoiron/sqlx"
 	"github.com/rs/zerolog"
+	"gorm.io/gorm"
 )
 
-func New(db *sqlx.DB, cfg *config.Config, log zerolog.Logger) http.Handler {
+func New(db *gorm.DB, cfg *config.Config, log zerolog.Logger) http.Handler {
 	r := chi.NewRouter()
 
 	// ── Global middleware ──────────────────────────────────────────────────
@@ -69,7 +69,7 @@ func New(db *sqlx.DB, cfg *config.Config, log zerolog.Logger) http.Handler {
 	programSvc := appprogram.NewService(programRepo, contractRepo, careSessionRepo)
 	careSessionSvc := appcssession.NewService(careSessionRepo)
 	serviceTypeSvc := appservicetype.NewService(serviceTypeRepo)
-	appointmentSvc := appappt.NewService(appointmentRepo)
+	appointmentSvc := appappt.NewService(appointmentRepo).WithProgramRepo(programRepo)
 
 	authH := handlers.NewAuthHandler(authSvc)
 	patientH := handlers.NewPatientHandler(patientSvc)

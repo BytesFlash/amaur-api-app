@@ -19,37 +19,47 @@ func main() {
 	if err != nil {
 		log.Fatalf("connect db: %v", err)
 	}
-	defer db.Close()
+	sqlDB, err := db.DB()
+	if err != nil {
+		log.Fatalf("unwrap db: %v", err)
+	}
+	defer sqlDB.Close()
 
 	ctx := context.Background()
 
-	// ── Asegurar que existe el rol super_admin ─────────────────────────────
-	var roleID uuid.UUID
-	err = db.QueryRowContext(ctx,
-		`SELECT id FROM roles WHERE name = 'super_admin' LIMIT 1`).Scan(&roleID)
-	if err != nil {
-		log.Fatalf("role super_admin not found — run migrations first: %v", err)
+	var roleRow struct {
+		ID uuid.UUID `gorm:"column:id"`
+	}
+	if err := db.WithContext(ctx).
+		Raw(`SELECT id FROM roles WHERE name = 'super_admin' LIMIT 1`).
+		Scan(&roleRow).Error; err != nil {
+		log.Fatalf("role super_admin not found - run migrations first: %v", err)
+	}
+	if roleRow.ID == uuid.Nil {
+		log.Fatalf("role super_admin not found - run migrations first")
 	}
 
-	// ── Verificar que el admin no exista ya ────────────────────────────────
-	var exists bool
-	_ = db.QueryRowContext(ctx,
-		`SELECT EXISTS(SELECT 1 FROM users WHERE email = $1)`,
-		cfg.SeedAdminEmail).Scan(&exists)
+	var existsRow struct {
+		Exists bool `gorm:"column:exists"`
+	}
+	if err := db.WithContext(ctx).
+		Raw(`SELECT EXISTS(SELECT 1 FROM users WHERE email = $1) AS exists`, cfg.SeedAdminEmail).
+		Scan(&existsRow).Error; err != nil {
+		log.Fatalf("check admin exists: %v", err)
+	}
 
-	if exists {
-		fmt.Printf("✓ Admin user already exists: %s\n", cfg.SeedAdminEmail)
+	if existsRow.Exists {
+		fmt.Printf("Admin user already exists: %s\n", cfg.SeedAdminEmail)
 		return
 	}
 
-	// ── Crear usuario admin ────────────────────────────────────────────────
 	hashed, err := password.Hash(cfg.SeedAdminPassword)
 	if err != nil {
 		log.Fatalf("hash password: %v", err)
 	}
 
 	userID := uuid.New()
-	_, err = db.ExecContext(ctx, `
+	if err := db.WithContext(ctx).Exec(`
 		INSERT INTO users (id, email, password_hash, first_name, last_name, is_active)
 		VALUES ($1, $2, $3, $4, $5, true)`,
 		userID,
@@ -57,20 +67,18 @@ func main() {
 		hashed,
 		cfg.SeedAdminFirstname,
 		cfg.SeedAdminLastname,
-	)
-	if err != nil {
+	).Error; err != nil {
 		log.Fatalf("insert user: %v", err)
 	}
 
-	// ── Asignar rol super_admin ────────────────────────────────────────────
-	_, err = db.ExecContext(ctx,
+	if err := db.WithContext(ctx).Exec(
 		`INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2)`,
-		userID, roleID)
-	if err != nil {
+		userID, roleRow.ID,
+	).Error; err != nil {
 		log.Fatalf("assign role: %v", err)
 	}
 
-	fmt.Printf("✓ Admin user created\n")
+	fmt.Printf("Admin user created\n")
 	fmt.Printf("  Email:    %s\n", cfg.SeedAdminEmail)
 	fmt.Printf("  Password: %s\n", cfg.SeedAdminPassword)
 }
