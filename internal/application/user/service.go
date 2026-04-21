@@ -70,6 +70,10 @@ func (s *Service) Create(ctx context.Context, req CreateUserRequest, createdBy u
 	if err != nil {
 		return nil, err
 	}
+	var createdByRef *uuid.UUID
+	if createdBy != uuid.Nil {
+		createdByRef = &createdBy
+	}
 	u := &user.User{
 		ID:           uuid.New(),
 		Email:        req.Email,
@@ -79,7 +83,7 @@ func (s *Service) Create(ctx context.Context, req CreateUserRequest, createdBy u
 		FirstName:    req.FirstName,
 		LastName:     req.LastName,
 		IsActive:     true,
-		CreatedBy:    &createdBy,
+		CreatedBy:    createdByRef,
 	}
 	if err := s.repo.Create(ctx, u); err != nil {
 		return nil, err

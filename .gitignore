@@ -20,7 +20,9 @@ coverage.html
 
 # Environment & secrets
 .env
-*.env.local
+.env.*
+!.env.example
+!.env.*.example
 
 # Air live-reload
 tmp/

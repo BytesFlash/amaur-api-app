@@ -42,10 +42,14 @@ func (r *UserRepository) FindByEmail(ctx context.Context, email string) (*user.U
 }
 
 func (r *UserRepository) Create(ctx context.Context, u *user.User) error {
+	createdAt := u.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
 	return rawExec(ctx, r.db,
 		`INSERT INTO users (id, email, company_id, patient_id, password_hash, first_name, last_name, is_active, created_at, created_by)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-		u.ID, u.Email, u.CompanyID, u.PatientID, u.PasswordHash, u.FirstName, u.LastName, u.IsActive, u.CreatedAt, u.CreatedBy)
+		u.ID, u.Email, u.CompanyID, u.PatientID, u.PasswordHash, u.FirstName, u.LastName, u.IsActive, createdAt, u.CreatedBy)
 }
 
 func (r *UserRepository) Update(ctx context.Context, u *user.User) error {
@@ -117,10 +121,14 @@ func (r *UserRepository) GetPermissionKeys(ctx context.Context, userID uuid.UUID
 }
 
 func (r *UserRepository) AssignRole(ctx context.Context, userID, roleID uuid.UUID, assignedBy uuid.UUID) error {
+	var assignedByRef *uuid.UUID
+	if assignedBy != uuid.Nil {
+		assignedByRef = &assignedBy
+	}
 	return rawExec(ctx, r.db,
 		`INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by)
          VALUES ($1, $2, NOW(), $3) ON CONFLICT DO NOTHING`,
-		userID, roleID, assignedBy)
+		userID, roleID, assignedByRef)
 }
 
 func (r *UserRepository) RevokeRole(ctx context.Context, userID, roleID uuid.UUID) error {
