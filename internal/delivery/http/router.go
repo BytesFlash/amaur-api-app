@@ -69,7 +69,7 @@ func New(db *gorm.DB, cfg *config.Config, log zerolog.Logger) http.Handler {
 	programSvc := appprogram.NewService(programRepo, contractRepo, careSessionRepo)
 	careSessionSvc := appcssession.NewService(careSessionRepo)
 	serviceTypeSvc := appservicetype.NewService(serviceTypeRepo)
-	appointmentSvc := appappt.NewService(appointmentRepo).WithProgramRepo(programRepo)
+	appointmentSvc := appappt.NewService(appointmentRepo).WithProgramRepo(programRepo).WithWorkerRepo(workerRepo)
 
 	authH := handlers.NewAuthHandler(authSvc)
 	patientH := handlers.NewPatientHandler(patientSvc)
@@ -256,12 +256,12 @@ func New(db *gorm.DB, cfg *config.Config, log zerolog.Logger) http.Handler {
 
 			// Individual appointments
 			r.Route("/appointments", func(r chi.Router) {
-				r.With(middleware.RequirePermission("visits:view")).Get("/", appointmentH.List)
-				r.With(middleware.RequirePermission("visits:create")).Post("/", appointmentH.Create)
+				r.With(middleware.RequirePermission("appointments:view")).Get("/", appointmentH.List)
+				r.With(middleware.RequirePermission("appointments:create")).Post("/", appointmentH.Create)
 				r.Route("/{id}", func(r chi.Router) {
-					r.With(middleware.RequirePermission("visits:view")).Get("/", appointmentH.GetByID)
-					r.With(middleware.RequirePermission("visits:edit")).Patch("/", appointmentH.Update)
-					r.With(middleware.RequirePermission("visits:delete")).Delete("/", appointmentH.Delete)
+					r.With(middleware.RequirePermission("appointments:view")).Get("/", appointmentH.GetByID)
+					r.With(middleware.RequirePermission("appointments:edit")).Patch("/", appointmentH.Update)
+					r.With(middleware.RequirePermission("appointments:delete")).Delete("/", appointmentH.Delete)
 				})
 			})
 		})

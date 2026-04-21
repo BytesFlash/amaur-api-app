@@ -7,42 +7,64 @@ import (
 
 	"amaur/api/internal/domain/appointment"
 	"amaur/api/internal/domain/program"
+	"amaur/api/internal/domain/worker"
+	"amaur/api/pkg/timeutil"
 
 	"github.com/google/uuid"
 )
 
 var (
-	ErrNotFound          = errors.New("appointment not found")
-	ErrInvalidDate       = errors.New("invalid scheduled_at date/time")
-	ErrInvalidRecurrence = errors.New("session_count must be between 1 and 52")
-	ErrWorkerBusy        = errors.New("worker already has another booking in this time block")
+	ErrNotFound            = errors.New("appointment not found")
+	ErrInvalidDate         = errors.New("invalid scheduled_at date/time")
+	ErrInvalidRecurrence   = errors.New("session_count must be between 1 and 52")
+	ErrInvalidStatus       = errors.New("invalid appointment status")
+	ErrOutsideAvailability = errors.New("la hora seleccionada está fuera de los bloques de disponibilidad del profesional")
+	ErrTooSoon             = errors.New("solo se pueden agendar horarios desde la próxima hora disponible")
+	ErrWorkerBusy          = errors.New("worker already has another booking in this time block")
 )
 
 type CreateAppointmentRequest struct {
-	PatientID       uuid.UUID  `json:"patient_id"`
-	WorkerID        *uuid.UUID `json:"worker_id"`
-	ServiceTypeID   uuid.UUID  `json:"service_type_id"`
-	CompanyID       *uuid.UUID `json:"company_id"`
-	ScheduledAt     string     `json:"scheduled_at"` // RFC3339 or "YYYY-MM-DDTHH:MM"
-	DurationMinutes *int       `json:"duration_minutes"`
-	Notes           *string    `json:"notes"`
+	PatientID        uuid.UUID  `json:"patient_id"`
+	WorkerID         *uuid.UUID `json:"worker_id"`
+	ServiceTypeID    uuid.UUID  `json:"service_type_id"`
+	CompanyID        *uuid.UUID `json:"company_id"`
+	ScheduledAt      string     `json:"scheduled_at"` // RFC3339 or "YYYY-MM-DDTHH:MM"
+	DurationMinutes  *int       `json:"duration_minutes"`
+	Notes            *string    `json:"notes"`
+	ChiefComplaint   *string    `json:"chief_complaint"`
+	Subjective       *string    `json:"subjective"`
+	Objective        *string    `json:"objective"`
+	Assessment       *string    `json:"assessment"`
+	Plan             *string    `json:"plan"`
+	FollowUpRequired *bool      `json:"follow_up_required"`
+	FollowUpNotes    *string    `json:"follow_up_notes"`
+	FollowUpDate     *string    `json:"follow_up_date"` // YYYY-MM-DD
 	// Recurring booking
 	SessionCount   int `json:"session_count"`   // 1 = single, >1 = batch
 	FrequencyWeeks int `json:"frequency_weeks"` // 1=weekly, 2=biweekly
 }
 
 type UpdateAppointmentRequest struct {
-	WorkerID        *uuid.UUID `json:"worker_id"`
-	ServiceTypeID   *uuid.UUID `json:"service_type_id"`
-	ScheduledAt     *string    `json:"scheduled_at"`
-	DurationMinutes *int       `json:"duration_minutes"`
-	Status          *string    `json:"status"`
-	Notes           *string    `json:"notes"`
+	WorkerID         *uuid.UUID `json:"worker_id"`
+	ServiceTypeID    *uuid.UUID `json:"service_type_id"`
+	ScheduledAt      *string    `json:"scheduled_at"`
+	DurationMinutes  *int       `json:"duration_minutes"`
+	Status           *string    `json:"status"`
+	Notes            *string    `json:"notes"`
+	ChiefComplaint   *string    `json:"chief_complaint"`
+	Subjective       *string    `json:"subjective"`
+	Objective        *string    `json:"objective"`
+	Assessment       *string    `json:"assessment"`
+	Plan             *string    `json:"plan"`
+	FollowUpRequired *bool      `json:"follow_up_required"`
+	FollowUpNotes    *string    `json:"follow_up_notes"`
+	FollowUpDate     *string    `json:"follow_up_date"` // YYYY-MM-DD
 }
 
 type Service struct {
 	repo        appointment.Repository
 	programRepo program.Repository
+	workerRepo  worker.Repository
 }
 
 func NewService(repo appointment.Repository) *Service {
@@ -51,6 +73,11 @@ func NewService(repo appointment.Repository) *Service {
 
 func (s *Service) WithProgramRepo(r program.Repository) *Service {
 	s.programRepo = r
+	return s
+}
+
+func (s *Service) WithWorkerRepo(r worker.Repository) *Service {
+	s.workerRepo = r
 	return s
 }
 
@@ -85,6 +112,9 @@ func (s *Service) Create(ctx context.Context, req CreateAppointmentRequest, by u
 		scheduledAt := first.AddDate(0, 0, i*freqWeeks*7)
 		if req.WorkerID != nil {
 			duration := coalesceDuration(req.DurationMinutes)
+			if err := s.ensureWorkerSlotAllowed(ctx, *req.WorkerID, scheduledAt, duration); err != nil {
+				return nil, err
+			}
 			occupied, err := s.repo.HasWorkerConflict(ctx, *req.WorkerID, scheduledAt, duration, nil)
 			if err != nil {
 				return nil, err
@@ -118,8 +148,16 @@ func (s *Service) Create(ctx context.Context, req CreateAppointmentRequest, by u
 			RecurringGroupID: groupID,
 			ScheduledAt:      scheduledAt,
 			DurationMinutes:  req.DurationMinutes,
-			Status:           "confirmed",
+			Status:           appointment.StatusRequested,
 			Notes:            req.Notes,
+			ChiefComplaint:   req.ChiefComplaint,
+			Subjective:       req.Subjective,
+			Objective:        req.Objective,
+			Assessment:       req.Assessment,
+			Plan:             req.Plan,
+			FollowUpRequired: coalesceBool(req.FollowUpRequired),
+			FollowUpNotes:    req.FollowUpNotes,
+			FollowUpDate:     parseDateOnlyPtr(req.FollowUpDate),
 			CreatedBy:        &by,
 		})
 	}
@@ -127,7 +165,17 @@ func (s *Service) Create(ctx context.Context, req CreateAppointmentRequest, by u
 	if err := s.repo.CreateBatch(ctx, batch); err != nil {
 		return nil, err
 	}
-	return batch, nil
+
+	created := make([]*appointment.Appointment, 0, len(batch))
+	for _, item := range batch {
+		enriched, err := s.repo.FindByID(ctx, item.ID)
+		if err != nil {
+			return nil, err
+		}
+		created = append(created, enriched)
+	}
+
+	return created, nil
 }
 
 func (s *Service) GetByID(ctx context.Context, id uuid.UUID) (*appointment.Appointment, error) {
@@ -135,6 +183,7 @@ func (s *Service) GetByID(ctx context.Context, id uuid.UUID) (*appointment.Appoi
 	if err != nil {
 		return nil, ErrNotFound
 	}
+	_ = s.autoCompleteIfExpired(ctx, a)
 	return a, nil
 }
 
@@ -161,13 +210,43 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, req UpdateAppointmen
 		a.DurationMinutes = req.DurationMinutes
 	}
 	if req.Status != nil {
+		if !isValidStatus(*req.Status) {
+			return nil, ErrInvalidStatus
+		}
 		a.Status = *req.Status
 	}
 	if req.Notes != nil {
 		a.Notes = req.Notes
 	}
+	if req.ChiefComplaint != nil {
+		a.ChiefComplaint = req.ChiefComplaint
+	}
+	if req.Subjective != nil {
+		a.Subjective = req.Subjective
+	}
+	if req.Objective != nil {
+		a.Objective = req.Objective
+	}
+	if req.Assessment != nil {
+		a.Assessment = req.Assessment
+	}
+	if req.Plan != nil {
+		a.Plan = req.Plan
+	}
+	if req.FollowUpRequired != nil {
+		a.FollowUpRequired = *req.FollowUpRequired
+	}
+	if req.FollowUpNotes != nil {
+		a.FollowUpNotes = req.FollowUpNotes
+	}
+	if req.FollowUpDate != nil {
+		a.FollowUpDate = parseDateOnlyPtr(req.FollowUpDate)
+	}
 	if a.WorkerID != nil {
 		duration := coalesceDuration(a.DurationMinutes)
+		if err := s.ensureWorkerSlotAllowed(ctx, *a.WorkerID, a.ScheduledAt, duration); err != nil {
+			return nil, err
+		}
 		occupied, err := s.repo.HasWorkerConflict(ctx, *a.WorkerID, a.ScheduledAt, duration, &a.ID)
 		if err != nil {
 			return nil, err
@@ -233,13 +312,22 @@ func (s *Service) List(ctx context.Context, patientID, workerID, companyID, stat
 			f.DateTo = &t
 		}
 	}
-	return s.repo.List(ctx, f, limit, offset)
+	items, total, err := s.repo.List(ctx, f, limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	for _, item := range items {
+		_ = s.autoCompleteIfExpired(ctx, item)
+	}
+	return items, total, nil
 }
 
 func parseScheduledAt(s string) (time.Time, error) {
-	formats := []string{time.RFC3339, "2006-01-02T15:04", "2006-01-02T15:04:05", "2006-01-02"}
-	for _, f := range formats {
-		if t, err := time.Parse(f, s); err == nil {
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t.In(timeutil.Santiago()), nil
+	}
+	for _, f := range []string{"2006-01-02T15:04", "2006-01-02T15:04:05", "2006-01-02"} {
+		if t, err := time.ParseInLocation(f, s, timeutil.Santiago()); err == nil {
 			return t, nil
 		}
 	}
@@ -251,4 +339,119 @@ func coalesceDuration(duration *int) int {
 		return *duration
 	}
 	return 60
+}
+
+func isValidStatus(status string) bool {
+	switch status {
+	case appointment.StatusRequested,
+		appointment.StatusConfirmed,
+		appointment.StatusInProgress,
+		appointment.StatusCompleted,
+		appointment.StatusCancelled,
+		appointment.StatusNoShow:
+		return true
+	default:
+		return false
+	}
+}
+
+func parseDateOnlyPtr(s *string) *time.Time {
+	if s == nil || *s == "" {
+		return nil
+	}
+	if t, err := time.Parse("2006-01-02", *s); err == nil {
+		return &t
+	}
+	return nil
+}
+
+func coalesceBool(value *bool) bool {
+	if value == nil {
+		return false
+	}
+	return *value
+}
+
+func (s *Service) autoCompleteIfExpired(ctx context.Context, item *appointment.Appointment) error {
+	if item == nil || item.Status != appointment.StatusInProgress {
+		return nil
+	}
+	endAt := item.ScheduledAt.Add(time.Duration(coalesceDuration(item.DurationMinutes)) * time.Minute)
+	if endAt.After(time.Now().In(timeutil.Santiago())) {
+		return nil
+	}
+	item.Status = appointment.StatusCompleted
+	now := time.Now()
+	item.UpdatedAt = &now
+	return s.repo.Update(ctx, item)
+}
+
+func (s *Service) ensureWorkerSlotAllowed(ctx context.Context, workerID uuid.UUID, scheduledAt time.Time, duration int) error {
+	if scheduledAt.Before(nextBookableHour()) {
+		return ErrTooSoon
+	}
+	if s.workerRepo == nil {
+		return nil
+	}
+	rules, err := s.workerRepo.ListAvailabilityRules(ctx, workerID)
+	if err != nil {
+		return err
+	}
+	if isWithinAvailability(rules, scheduledAt, duration) {
+		return nil
+	}
+	return ErrOutsideAvailability
+}
+
+func nextBookableHour() time.Time {
+	now := time.Now().In(timeutil.Santiago())
+	return now.Truncate(time.Hour).Add(time.Hour)
+}
+
+func isWithinAvailability(rules []*worker.AvailabilityRule, scheduledAt time.Time, duration int) bool {
+	if duration <= 0 {
+		duration = 60
+	}
+	slotEnd := scheduledAt.Add(time.Duration(duration) * time.Minute)
+	for _, rule := range rules {
+		if rule == nil || !rule.IsActive || rule.Weekday != int16(scheduledAt.Weekday()) {
+			continue
+		}
+		ruleStartTime, err := time.ParseInLocation("15:04", rule.StartTime, scheduledAt.Location())
+		if err != nil {
+			continue
+		}
+		ruleEndTime, err := time.ParseInLocation("15:04", rule.EndTime, scheduledAt.Location())
+		if err != nil {
+			continue
+		}
+		ruleStart := time.Date(
+			scheduledAt.Year(),
+			scheduledAt.Month(),
+			scheduledAt.Day(),
+			ruleStartTime.Hour(),
+			ruleStartTime.Minute(),
+			0,
+			0,
+			scheduledAt.Location(),
+		)
+		ruleEnd := time.Date(
+			scheduledAt.Year(),
+			scheduledAt.Month(),
+			scheduledAt.Day(),
+			ruleEndTime.Hour(),
+			ruleEndTime.Minute(),
+			0,
+			0,
+			scheduledAt.Location(),
+		)
+		if scheduledAt.Before(ruleStart) || slotEnd.After(ruleEnd) {
+			continue
+		}
+		if int(scheduledAt.Sub(ruleStart).Minutes())%duration != 0 {
+			continue
+		}
+		return true
+	}
+	return false
 }

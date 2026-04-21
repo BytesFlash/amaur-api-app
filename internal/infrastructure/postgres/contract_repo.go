@@ -102,6 +102,99 @@ func (r *contractRepo) List(ctx context.Context, f contract.Filter, limit, offse
 
 func (r *contractRepo) ListServices(ctx context.Context, contractID uuid.UUID) ([]*contract.ContractService, error) {
 	rows := []*contract.ContractService{}
-	err := rawSelectPtr(ctx, r.db, &rows, `SELECT * FROM contract_services WHERE contract_id=$1`, contractID)
+	err := r.db.WithContext(ctx).
+		Table("contract_services AS cs").
+		Select(`
+			cs.id,
+			cs.contract_id,
+			cs.service_type_id,
+			cs.quota_type,
+			cs.quantity_per_period,
+			cs.period_unit,
+			cs.sessions_included,
+			cs.sessions_used,
+			cs.hours_included,
+			cs.hours_used,
+			cs.price_per_unit,
+			cs.notes,
+			st.name AS service_type_name`).
+		Joins("JOIN service_types st ON st.id = cs.service_type_id").
+		Where("cs.contract_id = ?", contractID).
+		Order("st.name ASC, cs.id ASC").
+		Scan(&rows).Error
 	return rows, err
+}
+
+func (r *contractRepo) UpsertServices(ctx context.Context, contractID uuid.UUID, services []*contract.ContractService) error {
+	return withTx(ctx, r.db, func(tx *gorm.DB) error {
+		var existing []*contract.ContractService
+		if err := tx.WithContext(ctx).
+			Table("contract_services").
+			Where("contract_id = ?", contractID).
+			Find(&existing).Error; err != nil {
+			return err
+		}
+
+		existingByID := make(map[uuid.UUID]*contract.ContractService, len(existing))
+		for _, item := range existing {
+			existingByID[item.ID] = item
+		}
+
+		keepIDs := make([]uuid.UUID, 0, len(services))
+		for _, svc := range services {
+			if svc.ID != uuid.Nil {
+				keepIDs = append(keepIDs, svc.ID)
+			}
+		}
+
+		deleteQuery := tx.WithContext(ctx).Table("contract_services").Where("contract_id = ?", contractID)
+		if len(keepIDs) > 0 {
+			deleteQuery = deleteQuery.Where("id NOT IN ?", keepIDs)
+		}
+		if err := deleteQuery.Delete(&contract.ContractService{}).Error; err != nil {
+			return err
+		}
+
+		for _, svc := range services {
+			quotaType := svc.QuotaType
+			if quotaType == "" {
+				quotaType = "sessions"
+			}
+
+			values := map[string]interface{}{
+				"contract_id":         contractID,
+				"service_type_id":     svc.ServiceTypeID,
+				"quota_type":          quotaType,
+				"quantity_per_period": svc.QuantityPerPeriod,
+				"period_unit":         svc.PeriodUnit,
+				"sessions_included":   svc.SessionsIncluded,
+				"hours_included":      svc.HoursIncluded,
+				"price_per_unit":      svc.PricePerUnit,
+				"notes":               svc.Notes,
+			}
+
+			if svc.ID != uuid.Nil {
+				if _, ok := existingByID[svc.ID]; ok {
+					if err := tx.WithContext(ctx).
+						Table("contract_services").
+						Where("id = ? AND contract_id = ?", svc.ID, contractID).
+						Updates(values).Error; err != nil {
+						return err
+					}
+					continue
+				}
+			}
+
+			newID := svc.ID
+			if newID == uuid.Nil {
+				newID = uuid.New()
+			}
+			values["id"] = newID
+			if err := tx.WithContext(ctx).Table("contract_services").Create(values).Error; err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
 }

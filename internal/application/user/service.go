@@ -1,7 +1,8 @@
-﻿package user
+package user
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"strings"
 
@@ -20,11 +21,28 @@ var (
 	ErrRoleNotFound         = errors.New("role not found")
 	ErrCompanyScopeRequired = errors.New("company_id is required for company-scoped roles")
 	ErrPatientScopeRequired = errors.New("patient_id is required for company_worker role")
+	ErrSeedEmailRequired    = errors.New("seed admin email is required")
+	ErrSeedPasswordRequired = errors.New("seed admin password is required")
 )
 
 type Service struct {
 	repo       *postgres.UserRepository
 	workerRepo worker.Repository
+}
+
+type EnsureSuperAdminRequest struct {
+	Email     string
+	Password  string
+	FirstName string
+	LastName  string
+}
+
+type EnsureSuperAdminResult struct {
+	UserID        uuid.UUID
+	Email         string
+	Created       bool
+	RoleAssigned  bool
+	AlreadyActive bool
 }
 
 func NewService(repo *postgres.UserRepository, workerRepo worker.Repository) *Service {
@@ -40,10 +58,8 @@ func (s *Service) Create(ctx context.Context, req CreateUserRequest, createdBy u
 	if err != nil {
 		return nil, err
 	}
-	for _, rn := range roleNames {
-		if (rn == "company_hr" || rn == "company_worker") && req.CompanyID == nil {
-			return nil, ErrCompanyScopeRequired
-		}
+	if err := validateRoleScopes(roleNames, req.CompanyID, req.PatientID); err != nil {
+		return nil, err
 	}
 
 	existing, _ := s.repo.FindByEmail(ctx, req.Email)
@@ -70,6 +86,11 @@ func (s *Service) Create(ctx context.Context, req CreateUserRequest, createdBy u
 	}
 	for _, roleID := range req.RoleIDs {
 		if err := s.repo.AssignRole(ctx, u.ID, roleID, createdBy); err != nil {
+			return nil, err
+		}
+	}
+	if hasRole(roleNames, "professional") {
+		if err := s.ensureProfessionalProfile(ctx, u, req, createdBy); err != nil {
 			return nil, err
 		}
 	}
@@ -148,6 +169,13 @@ func (s *Service) AssignRoles(ctx context.Context, userID uuid.UUID, req AssignR
 	if err != nil {
 		return ErrUserNotFound
 	}
+	roleNames, err := s.repo.GetRoleNamesByIDs(ctx, req.RoleIDs)
+	if err != nil {
+		return err
+	}
+	if err := validateRoleScopes(roleNames, u.CompanyID, u.PatientID); err != nil {
+		return err
+	}
 	currentRoles, _ := s.repo.GetUserRoleIDs(ctx, userID)
 	for _, r := range currentRoles {
 		_ = s.repo.RevokeRole(ctx, userID, r)
@@ -157,9 +185,10 @@ func (s *Service) AssignRoles(ctx context.Context, userID uuid.UUID, req AssignR
 			return err
 		}
 	}
-	roleNames, err := s.repo.GetRoleNamesByIDs(ctx, req.RoleIDs)
-	if err == nil && hasRole(roleNames, "professional") {
-		_ = s.ensureProfessionalProfile(ctx, u, CreateUserRequest{}, assignedBy)
+	if hasRole(roleNames, "professional") {
+		if err := s.ensureProfessionalProfile(ctx, u, CreateUserRequest{}, assignedBy); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -181,6 +210,21 @@ func (s *Service) ListRoles(ctx context.Context) ([]*RoleDTO, error) {
 	return dtos, nil
 }
 
+func (s *Service) SyncProfessionalProfiles(ctx context.Context, createdBy uuid.UUID) (int, error) {
+	users, err := s.repo.ListProfessionalsMissingWorker(ctx)
+	if err != nil {
+		return 0, err
+	}
+	synced := 0
+	for _, u := range users {
+		if err := s.ensureProfessionalProfile(ctx, u, CreateUserRequest{}, createdBy); err != nil {
+			return synced, err
+		}
+		synced++
+	}
+	return synced, nil
+}
+
 func (s *Service) GetRoleIDByName(ctx context.Context, roleName string) (uuid.UUID, error) {
 	roles, err := s.repo.ListAllRoles(ctx)
 	if err != nil {
@@ -192,6 +236,81 @@ func (s *Service) GetRoleIDByName(ctx context.Context, roleName string) (uuid.UU
 		}
 	}
 	return uuid.Nil, ErrRoleNotFound
+}
+
+func (s *Service) EnsureSuperAdmin(
+	ctx context.Context,
+	req EnsureSuperAdminRequest,
+	createdBy uuid.UUID,
+) (*EnsureSuperAdminResult, error) {
+	email := normalizeEmail(req.Email)
+	if email == "" {
+		return nil, ErrSeedEmailRequired
+	}
+	passwordValue := strings.TrimSpace(req.Password)
+	if passwordValue == "" {
+		return nil, ErrSeedPasswordRequired
+	}
+
+	firstName := strings.TrimSpace(req.FirstName)
+	if firstName == "" {
+		firstName = "Super"
+	}
+	lastName := strings.TrimSpace(req.LastName)
+	if lastName == "" {
+		lastName = "Admin"
+	}
+
+	superAdminRoleID, err := s.GetRoleIDByName(ctx, "super_admin")
+	if err != nil {
+		return nil, err
+	}
+
+	result := &EnsureSuperAdminResult{
+		Email: email,
+	}
+
+	existing, err := s.repo.FindByEmail(ctx, email)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+
+	if existing == nil {
+		dto, createErr := s.Create(ctx, CreateUserRequest{
+			Email:     email,
+			Password:  passwordValue,
+			FirstName: firstName,
+			LastName:  lastName,
+			RoleIDs:   []uuid.UUID{superAdminRoleID},
+		}, createdBy)
+		if createErr != nil && !errors.Is(createErr, ErrEmailTaken) {
+			return nil, createErr
+		}
+		if createErr == nil && dto != nil {
+			result.Created = true
+		}
+
+		existing, err = s.repo.FindByEmail(ctx, email)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	result.UserID = existing.ID
+	result.AlreadyActive = existing.IsActive
+
+	roleNames, err := s.repo.GetRoleNames(ctx, existing.ID)
+	if err != nil {
+		return nil, err
+	}
+	if !hasRole(roleNames, "super_admin") {
+		if err := s.repo.AssignRole(ctx, existing.ID, superAdminRoleID, createdBy); err != nil {
+			return nil, err
+		}
+		result.RoleAssigned = true
+	}
+
+	return result, nil
 }
 
 func toDTO(u *user.User, roles []string) *UserDTO {
@@ -223,6 +342,10 @@ func (s *Service) ensureProfessionalProfile(ctx context.Context, u *user.User, r
 	if email == "" {
 		email = u.Email
 	}
+	var createdByRef *uuid.UUID
+	if createdBy != uuid.Nil {
+		createdByRef = &createdBy
+	}
 	w := &worker.Worker{
 		ID:                uuid.New(),
 		UserID:            &u.ID,
@@ -235,7 +358,7 @@ func (s *Service) ensureProfessionalProfile(ctx context.Context, u *user.User, r
 		Specialty:         req.Specialty,
 		IsActive:          true,
 		AvailabilityNotes: req.AvailabilityNotes,
-		CreatedBy:         &createdBy,
+		CreatedBy:         createdByRef,
 	}
 	return s.workerRepo.Create(ctx, w)
 }
@@ -247,6 +370,18 @@ func hasRole(roleNames []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func validateRoleScopes(roleNames []string, companyID, patientID *uuid.UUID) error {
+	for _, rn := range roleNames {
+		if (rn == "company_hr" || rn == "company_worker") && companyID == nil {
+			return ErrCompanyScopeRequired
+		}
+		if rn == "company_worker" && patientID == nil {
+			return ErrPatientScopeRequired
+		}
+	}
+	return nil
 }
 
 func normalizeEmail(email string) string {

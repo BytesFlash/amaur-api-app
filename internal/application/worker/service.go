@@ -12,8 +12,10 @@ import (
 	"amaur/api/internal/domain/program"
 	"amaur/api/internal/domain/worker"
 	"amaur/api/internal/infrastructure/postgres"
+	"amaur/api/pkg/timeutil"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 var ErrNotFound = errors.New("worker not found")
@@ -94,6 +96,7 @@ func (s *Service) Create(ctx context.Context, req CreateWorkerRequest, createdBy
 	}
 
 	resolvedUserID := req.UserID
+	createdFromLogin := false
 	if resolvedUserID == nil {
 		loginEmail := ""
 		if req.LoginEmail != nil {
@@ -124,13 +127,34 @@ func (s *Service) Create(ctx context.Context, req CreateWorkerRequest, createdBy
 			return nil, err
 		}
 		resolvedUserID = &createdUser.ID
+		createdFromLogin = true
 	}
-	if _, err := s.repo.FindByUserID(ctx, *resolvedUserID); err == nil {
-		return nil, ErrUserAlreadyLinked
+
+	existingWorker, err := s.repo.FindByUserID(ctx, *resolvedUserID)
+	if err == nil {
+		if !createdFromLogin {
+			return nil, ErrUserAlreadyLinked
+		}
+		updated, updateErr := s.populateWorkerProfile(ctx, existingWorker, req, createdBy)
+		if updateErr != nil {
+			_ = s.repo.SoftDelete(ctx, existingWorker.ID)
+			_ = s.userSvc.Delete(ctx, *resolvedUserID)
+			return nil, updateErr
+		}
+		return updated, nil
+	}
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		if createdFromLogin {
+			_ = s.userSvc.Delete(ctx, *resolvedUserID)
+		}
+		return nil, err
 	}
 
 	roles, err := s.userRepo.GetRoleNames(ctx, *resolvedUserID)
 	if err != nil {
+		if createdFromLogin {
+			_ = s.userSvc.Delete(ctx, *resolvedUserID)
+		}
 		return nil, err
 	}
 	isProfessional := false
@@ -141,6 +165,9 @@ func (s *Service) Create(ctx context.Context, req CreateWorkerRequest, createdBy
 		}
 	}
 	if !isProfessional {
+		if createdFromLogin {
+			_ = s.userSvc.Delete(ctx, *resolvedUserID)
+		}
 		return nil, ErrUserMustBeProfessional
 	}
 
@@ -149,6 +176,9 @@ func (s *Service) Create(ctx context.Context, req CreateWorkerRequest, createdBy
 	if req.Email != nil && *req.Email != "" {
 		existingUser, _ := s.userRepo.FindByEmail(ctx, strings.ToLower(strings.TrimSpace(*req.Email)))
 		if existingUser != nil && (resolvedUserID == nil || existingUser.ID != *resolvedUserID) {
+			if createdFromLogin {
+				_ = s.userSvc.Delete(ctx, *resolvedUserID)
+			}
 			return nil, ErrEmailUsedByAnotherUser
 		}
 	}
@@ -171,7 +201,7 @@ func (s *Service) Create(ctx context.Context, req CreateWorkerRequest, createdBy
 		CreatedBy:         &createdBy,
 	}
 	if err := s.repo.Create(ctx, w); err != nil {
-		if resolvedUserID != nil && req.UserID == nil {
+		if createdFromLogin {
 			_ = s.userSvc.Delete(ctx, *resolvedUserID)
 		}
 		return nil, err
@@ -180,6 +210,38 @@ func (s *Service) Create(ctx context.Context, req CreateWorkerRequest, createdBy
 	// Set specialties from catalog if provided.
 	if len(req.SpecialtyCodes) > 0 {
 		_ = s.repo.SetWorkerSpecialties(ctx, w.ID, req.SpecialtyCodes, createdBy)
+	}
+	w.Specialties, _ = s.repo.GetWorkerSpecialties(ctx, w.ID)
+	return w, nil
+}
+
+func (s *Service) populateWorkerProfile(ctx context.Context, w *worker.Worker, req CreateWorkerRequest, updatedBy uuid.UUID) (*worker.Worker, error) {
+	now := time.Now()
+
+	w.RUT = req.RUT
+	w.FirstName = req.FirstName
+	w.LastName = req.LastName
+	if req.Email != nil {
+		w.Email = req.Email
+	}
+	w.Phone = req.Phone
+	w.RoleTitle = req.RoleTitle
+	w.Specialty = req.Specialty
+	w.HireDate = parseDatePtr(req.HireDate)
+	w.BirthDate = parseDatePtr(req.BirthDate)
+	w.IsActive = true
+	w.AvailabilityNotes = req.AvailabilityNotes
+	w.InternalNotes = req.InternalNotes
+	w.UpdatedAt = &now
+	w.UpdatedBy = &updatedBy
+
+	if err := s.repo.Update(ctx, w); err != nil {
+		return nil, err
+	}
+	if req.SpecialtyCodes != nil {
+		if err := s.repo.SetWorkerSpecialties(ctx, w.ID, req.SpecialtyCodes, updatedBy); err != nil {
+			return nil, err
+		}
 	}
 	w.Specialties, _ = s.repo.GetWorkerSpecialties(ctx, w.ID)
 	return w, nil
@@ -353,7 +415,14 @@ func (s *Service) GetWorkerCalendar(ctx context.Context, workerID uuid.UUID, mon
 		}, 1000, 0)
 		if err == nil {
 			for _, a := range appts {
-				if a.Status == "confirmed" || a.Status == "scheduled" || a.Status == "completed" {
+				if a.Status == appointment.StatusInProgress {
+					_ = s.autoCompleteAppointmentIfExpired(ctx, a)
+				}
+				if a.Status == appointment.StatusRequested ||
+					a.Status == appointment.StatusConfirmed ||
+					a.Status == appointment.StatusInProgress ||
+					a.Status == "scheduled" ||
+					a.Status == appointment.StatusCompleted {
 					dateKey := a.ScheduledAt.Format("2006-01-02")
 					apptsByDate[dateKey] = append(apptsByDate[dateKey], a)
 				}
@@ -426,10 +495,16 @@ func (s *Service) GetWorkerCalendar(ctx context.Context, workerID uuid.UUID, mon
 				label = *a.ServiceTypeName
 			}
 			summs = append(summs, worker.ApptSummary{
+				AppointmentID:   &a.ID,
+				PatientID:       &a.PatientID,
+				ServiceTypeID:   &a.ServiceTypeID,
+				PatientName:     label,
+				ServiceTypeName: derefString(a.ServiceTypeName),
 				ScheduledAt:     a.ScheduledAt.Format("15:04"),
 				DurationMinutes: dur,
 				Type:            "individual",
 				Label:           label,
+				Status:          a.Status,
 			})
 		}
 		// Add group agenda sessions to booked time.
@@ -488,7 +563,7 @@ func (s *Service) GetWorkerSlots(ctx context.Context, workerID uuid.UUID, weekSt
 	if _, err := s.repo.FindByID(ctx, workerID); err != nil {
 		return nil, ErrNotFound
 	}
-	weekStart, err := time.Parse("2006-01-02", weekStartStr)
+	weekStart, err := time.ParseInLocation("2006-01-02", weekStartStr, timeutil.Santiago())
 	if err != nil {
 		return nil, fmt.Errorf("week_start must be YYYY-MM-DD")
 	}
@@ -515,7 +590,13 @@ func (s *Service) GetWorkerSlots(ctx context.Context, workerID uuid.UUID, weekSt
 		}, 500, 0)
 		if err == nil {
 			for _, a := range appts {
-				if a.Status == "confirmed" || a.Status == "scheduled" {
+				if a.Status == appointment.StatusInProgress {
+					_ = s.autoCompleteAppointmentIfExpired(ctx, a)
+				}
+				if a.Status == appointment.StatusRequested ||
+					a.Status == appointment.StatusConfirmed ||
+					a.Status == appointment.StatusInProgress ||
+					a.Status == "scheduled" {
 					occupied = append(occupied, a)
 				}
 			}
@@ -532,17 +613,19 @@ func (s *Service) GetWorkerSlots(ctx context.Context, workerID uuid.UUID, weekSt
 				if svc.PlannedStartTime == nil || svc.PlannedDurationMinutes == nil {
 					continue
 				}
-				t, err := time.Parse("15:04", *svc.PlannedStartTime)
+				t, err := time.ParseInLocation("15:04", *svc.PlannedStartTime, timeutil.Santiago())
 				if err != nil {
 					continue
 				}
 				d := svc.ScheduledDate
-				start := time.Date(d.Year(), d.Month(), d.Day(), t.Hour(), t.Minute(), 0, 0, time.UTC)
+				start := time.Date(d.Year(), d.Month(), d.Day(), t.Hour(), t.Minute(), 0, 0, timeutil.Santiago())
 				end := start.Add(time.Duration(*svc.PlannedDurationMinutes) * time.Minute)
 				groupOccupied = append(groupOccupied, absInterval{start, end})
 			}
 		}
 	}
+
+	minBookableAt := time.Now().In(timeutil.Santiago()).Truncate(time.Hour).Add(time.Hour)
 
 	var slots []worker.TimeSlot
 	for day := 0; day < 7; day++ {
@@ -569,8 +652,13 @@ func (s *Service) GetWorkerSlots(ctx context.Context, workerID uuid.UUID, weekSt
 				slotEnd := cur.Add(time.Duration(duration) * time.Minute)
 				// Build absolute times for occupancy check.
 				slotStartAbs := time.Date(date.Year(), date.Month(), date.Day(),
-					cur.Hour(), cur.Minute(), 0, 0, time.UTC)
+					cur.Hour(), cur.Minute(), 0, 0, timeutil.Santiago())
 				slotEndAbs := slotStartAbs.Add(time.Duration(duration) * time.Minute)
+
+				if slotStartAbs.Before(minBookableAt) {
+					cur = slotEnd
+					continue
+				}
 
 				available := true
 				for _, a := range occupied {
@@ -634,4 +722,29 @@ func parseDatePtr(s *string) *time.Time {
 		}
 	}
 	return &t
+}
+
+func (s *Service) autoCompleteAppointmentIfExpired(ctx context.Context, a *appointment.Appointment) error {
+	if a == nil || a.Status != appointment.StatusInProgress {
+		return nil
+	}
+	duration := 60
+	if a.DurationMinutes != nil && *a.DurationMinutes > 0 {
+		duration = *a.DurationMinutes
+	}
+	endAt := a.ScheduledAt.Add(time.Duration(duration) * time.Minute)
+	if endAt.After(time.Now().In(timeutil.Santiago())) {
+		return nil
+	}
+	a.Status = appointment.StatusCompleted
+	now := time.Now()
+	a.UpdatedAt = &now
+	return s.apptRepo.Update(ctx, a)
+}
+
+func derefString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }

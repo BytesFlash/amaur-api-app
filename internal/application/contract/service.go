@@ -13,30 +13,44 @@ import (
 var ErrNotFound = errors.New("contract not found")
 
 type CreateContractRequest struct {
-	CompanyID         uuid.UUID `json:"company_id"`
-	Name              string    `json:"name"`
-	ContractType      *string   `json:"contract_type"`
-	Status            string    `json:"status"`
-	StartDate         string    `json:"start_date"`
-	EndDate           *string   `json:"end_date"`
-	RenewalDate       *string   `json:"renewal_date"`
-	ValueCLP          *float64  `json:"value_clp"`
-	BillingCycle      *string   `json:"billing_cycle"`
-	Notes             *string   `json:"notes"`
-	SignedDocumentURL *string   `json:"signed_document_url"`
+	CompanyID         uuid.UUID              `json:"company_id"`
+	Name              string                 `json:"name"`
+	ContractType      *string                `json:"contract_type"`
+	Status            string                 `json:"status"`
+	StartDate         string                 `json:"start_date"`
+	EndDate           *string                `json:"end_date"`
+	RenewalDate       *string                `json:"renewal_date"`
+	ValueCLP          *float64               `json:"value_clp"`
+	BillingCycle      *string                `json:"billing_cycle"`
+	Notes             *string                `json:"notes"`
+	SignedDocumentURL *string                `json:"signed_document_url"`
+	Services          []ContractServiceInput `json:"services"`
 }
 
 type UpdateContractRequest struct {
-	Name              *string  `json:"name"`
-	ContractType      *string  `json:"contract_type"`
-	Status            *string  `json:"status"`
-	StartDate         *string  `json:"start_date"`
-	EndDate           *string  `json:"end_date"`
-	RenewalDate       *string  `json:"renewal_date"`
-	ValueCLP          *float64 `json:"value_clp"`
-	BillingCycle      *string  `json:"billing_cycle"`
-	Notes             *string  `json:"notes"`
-	SignedDocumentURL *string  `json:"signed_document_url"`
+	Name              *string                 `json:"name"`
+	ContractType      *string                 `json:"contract_type"`
+	Status            *string                 `json:"status"`
+	StartDate         *string                 `json:"start_date"`
+	EndDate           *string                 `json:"end_date"`
+	RenewalDate       *string                 `json:"renewal_date"`
+	ValueCLP          *float64                `json:"value_clp"`
+	BillingCycle      *string                 `json:"billing_cycle"`
+	Notes             *string                 `json:"notes"`
+	SignedDocumentURL *string                 `json:"signed_document_url"`
+	Services          *[]ContractServiceInput `json:"services"`
+}
+
+type ContractServiceInput struct {
+	ID                *uuid.UUID `json:"id,omitempty"`
+	ServiceTypeID     uuid.UUID  `json:"service_type_id"`
+	QuotaType         string     `json:"quota_type"`
+	QuantityPerPeriod *int       `json:"quantity_per_period"`
+	PeriodUnit        *string    `json:"period_unit"`
+	SessionsIncluded  *int       `json:"sessions_included"`
+	HoursIncluded     *float64   `json:"hours_included"`
+	PricePerUnit      *float64   `json:"price_per_unit"`
+	Notes             *string    `json:"notes"`
 }
 
 type Service struct {
@@ -70,6 +84,11 @@ func (s *Service) Create(ctx context.Context, req CreateContractRequest) (*contr
 	}
 	if err := s.repo.Create(ctx, c); err != nil {
 		return nil, err
+	}
+	if len(req.Services) > 0 {
+		if err := s.repo.UpsertServices(ctx, c.ID, mapServiceInputs(req.Services, c.ID)); err != nil {
+			return nil, err
+		}
 	}
 	return c, nil
 }
@@ -123,6 +142,11 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, req UpdateContractRe
 	if err := s.repo.Update(ctx, c); err != nil {
 		return nil, err
 	}
+	if req.Services != nil {
+		if err := s.repo.UpsertServices(ctx, c.ID, mapServiceInputs(*req.Services, c.ID)); err != nil {
+			return nil, err
+		}
+	}
 	return c, nil
 }
 
@@ -164,4 +188,30 @@ func parseDatePtr(s *string) *time.Time {
 
 func (s *Service) ListServices(ctx context.Context, contractID uuid.UUID) ([]*contract.ContractService, error) {
 	return s.repo.ListServices(ctx, contractID)
+}
+
+func mapServiceInputs(inputs []ContractServiceInput, contractID uuid.UUID) []*contract.ContractService {
+	services := make([]*contract.ContractService, 0, len(inputs))
+	for _, input := range inputs {
+		quotaType := input.QuotaType
+		if quotaType == "" {
+			quotaType = "sessions"
+		}
+		service := &contract.ContractService{
+			ContractID:        contractID,
+			ServiceTypeID:     input.ServiceTypeID,
+			QuotaType:         quotaType,
+			QuantityPerPeriod: input.QuantityPerPeriod,
+			PeriodUnit:        input.PeriodUnit,
+			SessionsIncluded:  input.SessionsIncluded,
+			HoursIncluded:     input.HoursIncluded,
+			PricePerUnit:      input.PricePerUnit,
+			Notes:             input.Notes,
+		}
+		if input.ID != nil {
+			service.ID = *input.ID
+		}
+		services = append(services, service)
+	}
+	return services
 }

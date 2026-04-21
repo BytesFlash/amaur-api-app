@@ -1,4 +1,4 @@
-﻿package handlers
+package handlers
 
 import (
 	"encoding/json"
@@ -158,6 +158,14 @@ func (h *UserHandler) AssignRoles(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, appuser.ErrRoleRequired) {
 			response.BadRequest(w, "ROLE_REQUIRED", "At least one role is required")
+			return
+		}
+		if errors.Is(err, appuser.ErrCompanyScopeRequired) {
+			response.BadRequest(w, "COMPANY_SCOPE_REQUIRED", "company_id is required for company-scoped roles")
+			return
+		}
+		if errors.Is(err, appuser.ErrPatientScopeRequired) {
+			response.BadRequest(w, "PATIENT_SCOPE_REQUIRED", "patient_id is required for company_worker role")
 			return
 		}
 		response.InternalError(w)

@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	appuser "amaur/api/internal/application/user"
 	"amaur/api/internal/config"
 	chihttp "amaur/api/internal/delivery/http"
 	"amaur/api/internal/infrastructure/postgres"
@@ -17,6 +18,7 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
+	"github.com/google/uuid"
 )
 
 func main() {
@@ -46,6 +48,44 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to run migrations")
 	}
 	log.Info().Msg("migrations applied")
+
+	userRepo := postgres.NewUserRepository(db)
+	workerRepo := postgres.NewWorkerRepository(db)
+	userSvc := appuser.NewService(userRepo, workerRepo)
+
+	if cfg.SeedAdminOnStartup {
+		seedResult, err := userSvc.EnsureSuperAdmin(context.Background(), appuser.EnsureSuperAdminRequest{
+			Email:     cfg.SeedAdminEmail,
+			Password:  cfg.SeedAdminPassword,
+			FirstName: cfg.SeedAdminFirstname,
+			LastName:  cfg.SeedAdminLastname,
+		}, uuid.Nil)
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to ensure super admin seed user")
+		}
+
+		seedLog := log.Info().
+			Str("email", seedResult.Email).
+			Str("user_id", seedResult.UserID.String()).
+			Bool("created", seedResult.Created).
+			Bool("role_assigned", seedResult.RoleAssigned)
+
+		if seedResult.Created {
+			seedLog.Msg("seed super admin created automatically")
+		} else if seedResult.RoleAssigned {
+			seedLog.Msg("seed super admin role assigned automatically")
+		} else {
+			seedLog.Msg("seed super admin already present")
+		}
+	}
+
+	syncedProfiles, err := userSvc.SyncProfessionalProfiles(context.Background(), uuid.Nil)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to sync professional worker profiles")
+	}
+	if syncedProfiles > 0 {
+		log.Info().Int("count", syncedProfiles).Msg("synced professional worker profiles")
+	}
 
 	// Router
 	router := chihttp.New(db, cfg, log)

@@ -15,10 +15,16 @@ type SpecialtyItem struct {
 
 // ApptSummary is a lightweight view of an appointment used in calendar responses.
 type ApptSummary struct {
-	ScheduledAt     string `json:"scheduled_at"` // "HH:MM"
-	DurationMinutes int    `json:"duration_minutes"`
-	Type            string `json:"type"`  // "individual" | "group"
-	Label           string `json:"label"` // patient/company name or service type
+	AppointmentID   *uuid.UUID `json:"appointment_id,omitempty"`
+	PatientID       *uuid.UUID `json:"patient_id,omitempty"`
+	ServiceTypeID   *uuid.UUID `json:"service_type_id,omitempty"`
+	PatientName     string     `json:"patient_name,omitempty"`
+	ServiceTypeName string     `json:"service_type_name,omitempty"`
+	ScheduledAt     string     `json:"scheduled_at"` // "HH:MM"
+	DurationMinutes int        `json:"duration_minutes"`
+	Type            string     `json:"type"`  // "individual" | "group"
+	Label           string     `json:"label"` // patient/company name or service type
+	Status          string     `json:"status,omitempty"`
 }
 
 // DayCalendar summarises availability and bookings for a single calendar day.
@@ -74,7 +80,7 @@ type Worker struct {
 	DeletedAt         *time.Time `db:"deleted_at" json:"-"`
 
 	// Populated from worker_specialties join (not a DB column).
-	Specialties []SpecialtyItem `db:"-" json:"specialties,omitempty"`
+	Specialties []SpecialtyItem `db:"-" gorm:"-" json:"specialties,omitempty"`
 }
 
 func (w *Worker) FullName() string {

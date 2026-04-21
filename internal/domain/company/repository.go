@@ -7,6 +7,7 @@ import (
 )
 
 type Filter struct {
+	ID       *uuid.UUID
 	Search   string
 	Status   string
 	Region   string

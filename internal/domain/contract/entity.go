@@ -39,6 +39,9 @@ type ContractService struct {
 	HoursUsed         float64   `db:"hours_used"           json:"hours_used"`
 	PricePerUnit      *float64  `db:"price_per_unit"       json:"price_per_unit,omitempty"`
 	Notes             *string   `db:"notes"                json:"notes,omitempty"`
+
+	// Populated when listing services with the service_types join.
+	ServiceTypeName *string `db:"service_type_name" gorm:"-" json:"service_type_name,omitempty"`
 }
 
 type Filter struct {
@@ -53,4 +56,5 @@ type Repository interface {
 	Delete(ctx context.Context, id uuid.UUID) error
 	List(ctx context.Context, f Filter, limit, offset int) ([]*Contract, int64, error)
 	ListServices(ctx context.Context, contractID uuid.UUID) ([]*ContractService, error)
+	UpsertServices(ctx context.Context, contractID uuid.UUID, services []*ContractService) error
 }

@@ -93,6 +93,11 @@ func (r *companyRepo) List(ctx context.Context, f company.Filter, limit, offset 
 	where := []string{"deleted_at IS NULL"}
 	idx := 1
 
+	if f.ID != nil {
+		where = append(where, fmt.Sprintf(`id = $%d`, idx))
+		args = append(args, *f.ID)
+		idx++
+	}
 	if f.Search != "" {
 		where = append(where, fmt.Sprintf(
 			`(name ILIKE $%d OR fantasy_name ILIKE $%d OR rut ILIKE $%d)`, idx, idx+1, idx+2))

@@ -15,6 +15,10 @@ func RequirePermission(perm string) func(http.Handler) http.Handler {
 				response.Unauthorized(w, "Not authenticated")
 				return
 			}
+			if claims.HasRole("super_admin") {
+				next.ServeHTTP(w, r)
+				return
+			}
 			if !claims.HasPermission(perm) {
 				response.Forbidden(w, "You do not have permission to perform this action")
 				return

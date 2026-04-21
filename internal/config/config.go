@@ -3,6 +3,8 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -28,6 +30,7 @@ type Config struct {
 	SeedAdminPassword  string
 	SeedAdminFirstname string
 	SeedAdminLastname  string
+	SeedAdminOnStartup bool
 }
 
 func Load() *Config {
@@ -70,6 +73,7 @@ func Load() *Config {
 		SeedAdminPassword:  getEnv("SEED_ADMIN_PASSWORD", "ChangeThisNow!2026"),
 		SeedAdminFirstname: getEnv("SEED_ADMIN_FIRSTNAME", "Super"),
 		SeedAdminLastname:  getEnv("SEED_ADMIN_LASTNAME", "Admin"),
+		SeedAdminOnStartup: getEnvBool("SEED_ADMIN_ON_STARTUP", true),
 	}
 }
 
@@ -88,4 +92,16 @@ func getEnvRequired(key string) string {
 		panic("required environment variable not set: " + key)
 	}
 	return v
+}
+
+func getEnvBool(key string, fallback bool) bool {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseBool(v)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }

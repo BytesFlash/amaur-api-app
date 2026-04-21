@@ -19,24 +19,32 @@ func NewWorkerRepository(db *gorm.DB) worker.Repository {
 }
 
 func (r *workerRepo) Create(ctx context.Context, w *worker.Worker) error {
-	return rawExec(ctx, r.db, `
-		INSERT INTO amaur_workers (
-			id, user_id, rut, first_name, last_name, email, phone,
-			role_title, specialty, hire_date, birth_date, is_active,
-			availability_notes, internal_notes, created_by
-		) VALUES (
-			$1,$2,$3,$4,$5,$6,$7,
-			$8,$9,$10,$11,$12,
-			$13,$14,$15
-		)`,
-		w.ID, w.UserID, w.RUT, w.FirstName, w.LastName, w.Email, w.Phone,
-		w.RoleTitle, w.Specialty, w.HireDate, w.BirthDate, w.IsActive,
-		w.AvailabilityNotes, w.InternalNotes, w.CreatedBy)
+	values := map[string]interface{}{
+		"id":                 w.ID,
+		"user_id":            w.UserID,
+		"rut":                w.RUT,
+		"first_name":         w.FirstName,
+		"last_name":          w.LastName,
+		"email":              w.Email,
+		"phone":              w.Phone,
+		"role_title":         w.RoleTitle,
+		"specialty":          w.Specialty,
+		"hire_date":          w.HireDate,
+		"birth_date":         w.BirthDate,
+		"is_active":          w.IsActive,
+		"availability_notes": w.AvailabilityNotes,
+		"internal_notes":     w.InternalNotes,
+		"created_by":         w.CreatedBy,
+	}
+	return r.db.WithContext(ctx).Table("amaur_workers").Create(values).Error
 }
 
 func (r *workerRepo) FindByID(ctx context.Context, id uuid.UUID) (*worker.Worker, error) {
 	var w worker.Worker
-	err := rawGet(ctx, r.db, &w, `SELECT * FROM amaur_workers WHERE id = $1 AND deleted_at IS NULL`, id)
+	err := r.db.WithContext(ctx).
+		Table("amaur_workers").
+		Where("id = ? AND deleted_at IS NULL", id).
+		Take(&w).Error
 	if err != nil {
 		return nil, err
 	}
@@ -45,7 +53,10 @@ func (r *workerRepo) FindByID(ctx context.Context, id uuid.UUID) (*worker.Worker
 
 func (r *workerRepo) FindByUserID(ctx context.Context, userID uuid.UUID) (*worker.Worker, error) {
 	var w worker.Worker
-	err := rawGet(ctx, r.db, &w, `SELECT * FROM amaur_workers WHERE user_id = $1 AND deleted_at IS NULL`, userID)
+	err := r.db.WithContext(ctx).
+		Table("amaur_workers").
+		Where("user_id = ? AND deleted_at IS NULL", userID).
+		Take(&w).Error
 	if err != nil {
 		return nil, err
 	}
@@ -53,31 +64,34 @@ func (r *workerRepo) FindByUserID(ctx context.Context, userID uuid.UUID) (*worke
 }
 
 func (r *workerRepo) Update(ctx context.Context, w *worker.Worker) error {
-	return rawExec(ctx, r.db, `
-		UPDATE amaur_workers SET
-			rut = $1,
-			first_name = $2,
-			last_name = $3,
-			email = $4,
-			phone = $5,
-			role_title = $6,
-			specialty = $7,
-			hire_date = $8,
-			birth_date = $9,
-			termination_date = $10,
-			is_active = $11,
-			availability_notes = $12,
-			internal_notes = $13,
-			updated_by = $14,
-			updated_at = NOW()
-		WHERE id = $15 AND deleted_at IS NULL`,
-		w.RUT, w.FirstName, w.LastName, w.Email, w.Phone,
-		w.RoleTitle, w.Specialty, w.HireDate, w.BirthDate, w.TerminationDate,
-		w.IsActive, w.AvailabilityNotes, w.InternalNotes, w.UpdatedBy, w.ID)
+	updates := map[string]interface{}{
+		"rut":                w.RUT,
+		"first_name":         w.FirstName,
+		"last_name":          w.LastName,
+		"email":              w.Email,
+		"phone":              w.Phone,
+		"role_title":         w.RoleTitle,
+		"specialty":          w.Specialty,
+		"hire_date":          w.HireDate,
+		"birth_date":         w.BirthDate,
+		"termination_date":   w.TerminationDate,
+		"is_active":          w.IsActive,
+		"availability_notes": w.AvailabilityNotes,
+		"internal_notes":     w.InternalNotes,
+		"updated_by":         w.UpdatedBy,
+		"updated_at":         gorm.Expr("NOW()"),
+	}
+	return r.db.WithContext(ctx).
+		Table("amaur_workers").
+		Where("id = ? AND deleted_at IS NULL", w.ID).
+		Updates(updates).Error
 }
 
 func (r *workerRepo) SoftDelete(ctx context.Context, id uuid.UUID) error {
-	return rawExec(ctx, r.db, `UPDATE amaur_workers SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL`, id)
+	return r.db.WithContext(ctx).
+		Table("amaur_workers").
+		Where("id = ? AND deleted_at IS NULL", id).
+		Update("deleted_at", gorm.Expr("NOW()")).Error
 }
 
 func (r *workerRepo) ListActive(ctx context.Context, limit, offset int) ([]*worker.Worker, int64, error) {
@@ -85,42 +99,33 @@ func (r *workerRepo) ListActive(ctx context.Context, limit, offset int) ([]*work
 }
 
 func (r *workerRepo) List(ctx context.Context, search string, specialtyCode string, onlyActive bool, limit, offset int) ([]*worker.Worker, int64, error) {
-	args := []interface{}{}
-	where := "w.deleted_at IS NULL"
-	idx := 1
-
+	query := r.db.WithContext(ctx).Table("amaur_workers AS w").Where("w.deleted_at IS NULL")
 	if onlyActive {
-		where += " AND w.is_active = TRUE"
+		query = query.Where("w.is_active = ?", true)
 	}
 	if search != "" {
-		where += fmt.Sprintf(
-			` AND (w.first_name ILIKE $%d OR w.last_name ILIKE $%d OR w.email ILIKE $%d)`,
-			idx, idx+1, idx+2)
 		like := "%" + search + "%"
-		args = append(args, like, like, like)
-		idx += 3
+		query = query.Where("(w.first_name ILIKE ? OR w.last_name ILIKE ? OR w.email ILIKE ?)", like, like, like)
 	}
 	if specialtyCode != "" {
-		where += fmt.Sprintf(
-			` AND EXISTS (SELECT 1 FROM worker_specialties ws WHERE ws.worker_id = w.id AND ws.specialty_code = $%d)`,
-			idx)
-		args = append(args, specialtyCode)
-		idx++
+		query = query.Where(
+			"EXISTS (SELECT 1 FROM worker_specialties ws WHERE ws.worker_id = w.id AND ws.specialty_code = ?)",
+			specialtyCode,
+		)
 	}
 
-	var totalRow struct {
-		Count int64 `gorm:"column:count"`
-	}
-	if err := rawGet(ctx, r.db, &totalRow, `SELECT COUNT(*) AS count FROM amaur_workers w WHERE `+where, args...); err != nil {
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
 
-	args = append(args, limit, offset)
 	var workers []*worker.Worker
-	if err := rawSelectPtr(ctx, r.db, &workers,
-		`SELECT w.* FROM amaur_workers w WHERE `+where+
-			fmt.Sprintf(` ORDER BY w.last_name ASC, w.first_name ASC LIMIT $%d OFFSET $%d`, idx, idx+1),
-		args...); err != nil {
+	if err := query.
+		Select("w.*").
+		Order("w.last_name ASC, w.first_name ASC").
+		Limit(limit).
+		Offset(offset).
+		Scan(&workers).Error; err != nil {
 		return nil, 0, err
 	}
 
@@ -139,7 +144,7 @@ func (r *workerRepo) List(ctx context.Context, search string, specialtyCode stri
 		}
 	}
 
-	return workers, totalRow.Count, nil
+	return workers, total, nil
 }
 
 func (r *workerRepo) LinkUser(ctx context.Context, workerID, userID uuid.UUID) error {

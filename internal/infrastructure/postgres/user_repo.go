@@ -269,3 +269,37 @@ func (r *UserRepository) GetRoleIDByName(ctx context.Context, name string) (uuid
 	err := rawGet(ctx, r.db, &row, `SELECT id FROM roles WHERE name = $1 LIMIT 1`, name)
 	return row.ID, err
 }
+
+func (r *UserRepository) ListProfessionalsMissingWorker(ctx context.Context) ([]*user.User, error) {
+	var items []*user.User
+	err := r.db.WithContext(ctx).
+		Table("users AS u").
+		Distinct().
+		Select([]string{
+			"u.id",
+			"u.email",
+			"u.company_id",
+			"u.patient_id",
+			"u.password_hash",
+			"u.first_name",
+			"u.last_name",
+			"u.is_active",
+			"u.last_login_at",
+			"u.failed_attempts",
+			"u.locked_until",
+			"u.created_at",
+			"u.updated_at",
+			"u.created_by",
+			"u.deleted_at",
+		}).
+		Joins("JOIN user_roles ur ON ur.user_id = u.id").
+		Joins("JOIN roles ro ON ro.id = ur.role_id AND ro.name = ?", "professional").
+		Joins("LEFT JOIN amaur_workers w ON w.user_id = u.id AND w.deleted_at IS NULL").
+		Where("u.deleted_at IS NULL").
+		Where("w.id IS NULL").
+		Scan(&items).Error
+	if err != nil {
+		return nil, err
+	}
+	return items, nil
+}

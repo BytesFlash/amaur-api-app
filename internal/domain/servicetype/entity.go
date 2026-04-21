@@ -27,7 +27,7 @@ type ServiceType struct {
 	UpdatedAt              *time.Time `db:"updated_at"               json:"updated_at,omitempty"`
 
 	// Populated from service_type_specialties join (not a DB column).
-	Specialties []SpecialtyItem `db:"-" json:"specialties,omitempty"`
+	Specialties []SpecialtyItem `db:"-" gorm:"-" json:"specialties,omitempty"`
 }
 
 // Repository defines the persistence contract for service types.

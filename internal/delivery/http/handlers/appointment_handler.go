@@ -8,6 +8,7 @@ import (
 	appappt "amaur/api/internal/application/appointment"
 	"amaur/api/internal/delivery/http/middleware"
 	"amaur/api/internal/delivery/http/response"
+	domainappt "amaur/api/internal/domain/appointment"
 	"amaur/api/pkg/pagination"
 
 	"github.com/go-chi/chi/v5"
@@ -62,6 +63,20 @@ func (h *AppointmentHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	claims := middleware.ClaimsFromContext(r.Context())
+	if middleware.IsPatientScopedRole(claims) {
+		if claims.PatientID == nil {
+			response.Forbidden(w, "Missing patient scope")
+			return
+		}
+		req.PatientID = *claims.PatientID
+	}
+	if middleware.IsCompanyScopedRole(claims) {
+		if claims.CompanyID == nil {
+			response.Forbidden(w, "Missing company scope")
+			return
+		}
+		req.CompanyID = claims.CompanyID
+	}
 	items, err := h.svc.Create(r.Context(), req, claims.UserID)
 	if err != nil {
 		switch {
@@ -69,6 +84,12 @@ func (h *AppointmentHandler) Create(w http.ResponseWriter, r *http.Request) {
 			response.BadRequest(w, "INVALID_DATE", err.Error())
 		case errors.Is(err, appappt.ErrInvalidRecurrence):
 			response.BadRequest(w, "INVALID_RECURRENCE", err.Error())
+		case errors.Is(err, appappt.ErrInvalidStatus):
+			response.BadRequest(w, "INVALID_STATUS", err.Error())
+		case errors.Is(err, appappt.ErrTooSoon):
+			response.BadRequest(w, "TIME_TOO_SOON", err.Error())
+		case errors.Is(err, appappt.ErrOutsideAvailability):
+			response.BadRequest(w, "OUTSIDE_AVAILABILITY", err.Error())
 		case errors.Is(err, appappt.ErrWorkerBusy):
 			response.Conflict(w, "WORKER_BUSY", err.Error())
 		default:
@@ -85,9 +106,8 @@ func (h *AppointmentHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 		response.BadRequest(w, "INVALID_ID", "Invalid appointment id")
 		return
 	}
-	item, err := h.svc.GetByID(r.Context(), id)
-	if err != nil {
-		response.NotFound(w, "APPOINTMENT_NOT_FOUND", "Appointment not found")
+	item, ok := h.getScopedAppointment(w, r, id)
+	if !ok {
 		return
 	}
 	response.OK(w, item)
@@ -97,6 +117,9 @@ func (h *AppointmentHandler) Update(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
 		response.BadRequest(w, "INVALID_ID", "Invalid appointment id")
+		return
+	}
+	if _, ok := h.getScopedAppointment(w, r, id); !ok {
 		return
 	}
 	var req appappt.UpdateAppointmentRequest
@@ -109,6 +132,22 @@ func (h *AppointmentHandler) Update(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, appappt.ErrNotFound) {
 			response.NotFound(w, "APPOINTMENT_NOT_FOUND", "Appointment not found")
+			return
+		}
+		if errors.Is(err, appappt.ErrInvalidDate) {
+			response.BadRequest(w, "INVALID_DATE", err.Error())
+			return
+		}
+		if errors.Is(err, appappt.ErrInvalidStatus) {
+			response.BadRequest(w, "INVALID_STATUS", err.Error())
+			return
+		}
+		if errors.Is(err, appappt.ErrTooSoon) {
+			response.BadRequest(w, "TIME_TOO_SOON", err.Error())
+			return
+		}
+		if errors.Is(err, appappt.ErrOutsideAvailability) {
+			response.BadRequest(w, "OUTSIDE_AVAILABILITY", err.Error())
 			return
 		}
 		if errors.Is(err, appappt.ErrWorkerBusy) {
@@ -127,6 +166,9 @@ func (h *AppointmentHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		response.BadRequest(w, "INVALID_ID", "Invalid appointment id")
 		return
 	}
+	if _, ok := h.getScopedAppointment(w, r, id); !ok {
+		return
+	}
 	if err := h.svc.Delete(r.Context(), id); err != nil {
 		if errors.Is(err, appappt.ErrNotFound) {
 			response.NotFound(w, "APPOINTMENT_NOT_FOUND", "Appointment not found")
@@ -136,4 +178,36 @@ func (h *AppointmentHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response.NoContent(w)
+}
+
+func (h *AppointmentHandler) getScopedAppointment(w http.ResponseWriter, r *http.Request, id uuid.UUID) (*domainappt.Appointment, bool) {
+	item, err := h.svc.GetByID(r.Context(), id)
+	if err != nil {
+		response.NotFound(w, "APPOINTMENT_NOT_FOUND", "Appointment not found")
+		return nil, false
+	}
+
+	claims := middleware.ClaimsFromContext(r.Context())
+	if middleware.IsPatientScopedRole(claims) {
+		if claims.PatientID == nil {
+			response.Forbidden(w, "Missing patient scope")
+			return nil, false
+		}
+		if item.PatientID != *claims.PatientID {
+			response.Forbidden(w, "You do not have access to this appointment")
+			return nil, false
+		}
+	}
+	if middleware.IsCompanyScopedRole(claims) {
+		if claims.CompanyID == nil {
+			response.Forbidden(w, "Missing company scope")
+			return nil, false
+		}
+		if item.CompanyID == nil || *item.CompanyID != *claims.CompanyID {
+			response.Forbidden(w, "You do not have access to this appointment")
+			return nil, false
+		}
+	}
+
+	return item, true
 }

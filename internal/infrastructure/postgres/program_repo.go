@@ -530,8 +530,8 @@ func (r *programRepo) HasWorkerScheduleConflict(ctx context.Context, workerID uu
 			WHERE s.worker_id = $1
 			  AND s.status IN ('planned', 'completed')
 			  AND a.scheduled_date = $2::date
-			  AND (a.scheduled_date + COALESCE(s.planned_start_time, a.scheduled_start)) < $3 + ($4 * INTERVAL '1 minute')
-			  AND (a.scheduled_date + COALESCE(s.planned_start_time, a.scheduled_start) + (COALESCE(s.planned_duration_minutes, 60) * INTERVAL '1 minute')) > $3
+			  AND (a.scheduled_date + COALESCE(s.planned_start_time, a.scheduled_start)) < ($3::timestamp + ($4::int * INTERVAL '1 minute'))
+			  AND ((a.scheduled_date + COALESCE(s.planned_start_time, a.scheduled_start)) + (COALESCE(s.planned_duration_minutes, 60) * INTERVAL '1 minute')) > $3::timestamp
 			  AND ($5::uuid IS NULL OR s.id <> $5)
 		) AS exists
 	`
