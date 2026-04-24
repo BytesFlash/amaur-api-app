@@ -25,6 +25,7 @@ type Config struct {
 
 	StorageProvider  string
 	StorageLocalPath string
+	PublicBaseURL    string
 
 	SeedAdminEmail     string
 	SeedAdminPassword  string
@@ -68,6 +69,7 @@ func Load() *Config {
 
 		StorageProvider:  getEnv("STORAGE_PROVIDER", "local"),
 		StorageLocalPath: getEnv("STORAGE_LOCAL_PATH", "./uploads"),
+		PublicBaseURL:    getEnv("PUBLIC_BASE_URL", "http://localhost:8080"),
 
 		SeedAdminEmail:     getEnv("SEED_ADMIN_EMAIL", "admin@amaur.cl"),
 		SeedAdminPassword:  getEnv("SEED_ADMIN_PASSWORD", "ChangeThisNow!2026"),

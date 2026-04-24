@@ -44,9 +44,10 @@ func New(db *gorm.DB, cfg *config.Config, log zerolog.Logger) http.Handler {
 		AllowCredentials: true,
 		MaxAge:           300,
 	}))
-
 	// ── Dependencies ───────────────────────────────────────────────────────
 	jwt := jwtpkg.NewManager(cfg.JWTSecret, cfg.JWTAccessExpiry, cfg.JWTRefreshExpiry)
+
+	mediaH := handlers.NewMediaHandler(cfg.StorageLocalPath, cfg.PublicBaseURL)
 
 	userRepo := postgres.NewUserRepository(db)
 	patientRepo := postgres.NewPatientRepository(db)
@@ -89,6 +90,10 @@ func New(db *gorm.DB, cfg *config.Config, log zerolog.Logger) http.Handler {
 		w.Write([]byte(`{"status":"ok"}`))
 	})
 
+	// ── Static: uploaded files ──────────────────────────────────────────────
+	uploadsFS := http.FileServer(http.Dir(cfg.StorageLocalPath))
+	r.Handle("/uploads/*", http.StripPrefix("/uploads/", uploadsFS))
+
 	// ── Public routes ──────────────────────────────────────────────────────
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Post("/auth/login", authH.Login)
@@ -100,6 +105,9 @@ func New(db *gorm.DB, cfg *config.Config, log zerolog.Logger) http.Handler {
 
 			r.Post("/auth/logout", authH.Logout)
 			r.Get("/auth/me", authH.Me)
+
+			// Media upload
+			r.With(middleware.RequirePermission("media:upload")).Post("/content/media/upload", mediaH.Upload)
 
 			// Patients
 			r.Route("/patients", func(r chi.Router) {
