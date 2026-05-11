@@ -2,8 +2,6 @@ package postgres
 
 import (
 	"context"
-	"fmt"
-	"strings"
 	"time"
 
 	"amaur/api/internal/domain/caresession"
@@ -42,20 +40,23 @@ func (r *careSessionRepo) Create(ctx context.Context, cs *caresession.CareSessio
 
 func (r *careSessionRepo) FindByID(ctx context.Context, id uuid.UUID) (*caresession.CareSession, error) {
 	var cs caresession.CareSession
-	err := rawGet(ctx, r.db, &cs, `
-		SELECT cs.*,
+	err := r.db.WithContext(ctx).
+		Table("care_sessions cs").
+		Joins("LEFT JOIN patients p ON p.id = cs.patient_id").
+		Joins("LEFT JOIN amaur_workers w ON w.id = cs.worker_id").
+		Joins("LEFT JOIN service_types st ON st.id = cs.service_type_id").
+		Joins("LEFT JOIN companies c ON c.id = cs.company_id").
+		Select(`cs.*,
 			p.first_name AS patient_first_name, p.last_name AS patient_last_name,
 			w.first_name AS worker_first_name, w.last_name AS worker_last_name,
-			st.name AS service_type_name,
-			c.name AS company_name
-		FROM care_sessions cs
-		JOIN patients p ON p.id = cs.patient_id
-		JOIN amaur_workers w ON w.id = cs.worker_id
-		JOIN service_types st ON st.id = cs.service_type_id
-		LEFT JOIN companies c ON c.id = cs.company_id
-		WHERE cs.id = $1`, id)
+			st.name AS service_type_name, c.name AS company_name`).
+		Where("cs.id = ?", id).
+		Scan(&cs).Error
 	if err != nil {
 		return nil, err
+	}
+	if cs.ID == uuid.Nil {
+		return nil, gorm.ErrRecordNotFound
 	}
 	return &cs, nil
 }
@@ -84,80 +85,59 @@ func (r *careSessionRepo) Delete(ctx context.Context, id uuid.UUID) error {
 }
 
 func (r *careSessionRepo) List(ctx context.Context, f caresession.Filter, limit, offset int) ([]*caresession.CareSession, int64, error) {
-	where := []string{"1=1"}
-	args := []interface{}{}
-	idx := 1
+	db := r.db.WithContext(ctx).
+		Table("care_sessions cs").
+		Joins("LEFT JOIN patients p ON p.id = cs.patient_id").
+		Joins("LEFT JOIN amaur_workers w ON w.id = cs.worker_id").
+		Joins("LEFT JOIN service_types st ON st.id = cs.service_type_id").
+		Joins("LEFT JOIN companies c ON c.id = cs.company_id")
 
 	if f.PatientID != nil {
-		where = append(where, fmt.Sprintf("cs.patient_id=$%d", idx))
-		args = append(args, *f.PatientID)
-		idx++
+		db = db.Where("cs.patient_id = ?", *f.PatientID)
 	}
 	if f.WorkerID != nil {
-		where = append(where, fmt.Sprintf("cs.worker_id=$%d", idx))
-		args = append(args, *f.WorkerID)
-		idx++
+		db = db.Where("cs.worker_id = ?", *f.WorkerID)
 	}
 	if f.CompanyID != nil {
-		where = append(where, fmt.Sprintf("cs.company_id=$%d", idx))
-		args = append(args, *f.CompanyID)
-		idx++
+		db = db.Where("cs.company_id = ?", *f.CompanyID)
 	}
 	if f.VisitID != nil {
-		where = append(where, fmt.Sprintf("cs.visit_id=$%d", idx))
-		args = append(args, *f.VisitID)
-		idx++
+		db = db.Where("cs.visit_id = ?", *f.VisitID)
 	}
 	if f.SessionType != "" {
-		where = append(where, fmt.Sprintf("cs.session_type=$%d", idx))
-		args = append(args, f.SessionType)
-		idx++
+		db = db.Where("cs.session_type = ?", f.SessionType)
 	}
 	if f.Status != "" {
-		where = append(where, fmt.Sprintf("cs.status=$%d", idx))
-		args = append(args, f.Status)
-		idx++
+		db = db.Where("cs.status = ?", f.Status)
 	}
 	if f.DateFrom != nil {
-		where = append(where, fmt.Sprintf("cs.session_date>=$%d", idx))
-		args = append(args, *f.DateFrom)
-		idx++
+		db = db.Where("cs.session_date >= ?", *f.DateFrom)
 	}
 	if f.DateTo != nil {
-		where = append(where, fmt.Sprintf("cs.session_date<=$%d", idx))
-		args = append(args, *f.DateTo)
-		idx++
+		db = db.Where("cs.session_date <= ?", *f.DateTo)
 	}
 
-	clause := strings.Join(where, " AND ")
-
-	var totalRow struct {
-		Count int64 `gorm:"column:count"`
-	}
-	if err := rawGet(ctx, r.db, &totalRow, `SELECT COUNT(*) AS count FROM care_sessions cs WHERE `+clause, args...); err != nil {
+	// COUNT uses same JOINs and WHERE as the data query — consistent totals.
+	var total int64
+	if err := db.Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
 
-	args = append(args, limit, offset)
 	var rows []*caresession.CareSession
-	if err := rawSelectPtr(ctx, r.db, &rows, fmt.Sprintf(`
-		SELECT cs.*,
+	err := db.
+		Select(`cs.*,
 			p.first_name AS patient_first_name, p.last_name AS patient_last_name,
 			w.first_name AS worker_first_name, w.last_name AS worker_last_name,
-			st.name AS service_type_name,
-			c.name AS company_name
-		FROM care_sessions cs
-		JOIN patients p ON p.id = cs.patient_id
-		JOIN amaur_workers w ON w.id = cs.worker_id
-		JOIN service_types st ON st.id = cs.service_type_id
-		LEFT JOIN companies c ON c.id = cs.company_id
-		WHERE %s
-		ORDER BY cs.session_date DESC, cs.session_time DESC
-		LIMIT $%d OFFSET $%d`, clause, idx, idx+1), args...); err != nil {
+			st.name AS service_type_name, c.name AS company_name`).
+		Order("cs.session_date DESC, cs.session_time DESC NULLS LAST").
+		Limit(limit).
+		Offset(offset).
+		Scan(&rows).Error
+	if err != nil {
 		return nil, 0, err
 	}
 
-	return rows, totalRow.Count, nil
+	return rows, total, nil
 }
 
 func (r *careSessionRepo) CreateGroupSession(ctx context.Context, gs *caresession.GroupSession) error {
@@ -176,14 +156,16 @@ func (r *careSessionRepo) CreateGroupSession(ctx context.Context, gs *caresessio
 
 func (r *careSessionRepo) ListGroupSessions(ctx context.Context, visitID uuid.UUID) ([]*caresession.GroupSession, error) {
 	var rows []*caresession.GroupSession
-	err := rawSelectPtr(ctx, r.db, &rows, `
-		SELECT gs.*,
+	err := r.db.WithContext(ctx).
+		Table("group_sessions gs").
+		Joins("LEFT JOIN service_types st ON st.id = gs.service_type_id").
+		Joins("LEFT JOIN amaur_workers w ON w.id = gs.worker_id").
+		Select(`gs.*,
 			st.name AS service_type_name,
-			w.first_name AS worker_first_name, w.last_name AS worker_last_name
-		FROM group_sessions gs
-		JOIN service_types st ON st.id = gs.service_type_id
-		LEFT JOIN amaur_workers w ON w.id = gs.worker_id
-		WHERE gs.visit_id = $1
-		ORDER BY gs.session_date, gs.session_time`, visitID)
+			w.first_name AS worker_first_name, w.last_name AS worker_last_name`).
+		Where("gs.visit_id = ?", visitID).
+		Order("gs.session_date, gs.session_time").
+		Scan(&rows).Error
 	return rows, err
 }
+

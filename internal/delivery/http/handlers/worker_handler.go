@@ -114,6 +114,16 @@ func (h *WorkerHandler) GetWorkerCalendar(w http.ResponseWriter, r *http.Request
 		response.BadRequest(w, "INVALID_ID", "Invalid worker id")
 		return
 	}
+
+	// Workers with appointments:view (but not workers:view) can only access their own calendar.
+	claims := middleware.ClaimsFromContext(r.Context())
+	if middleware.IsCompanyWorkerRole(claims) {
+		if claims.WorkerID == nil || *claims.WorkerID != id {
+			response.Forbidden(w, "You can only view your own calendar")
+			return
+		}
+	}
+
 	month := r.URL.Query().Get("month") // "YYYY-MM"
 	days, err := h.svc.GetWorkerCalendar(r.Context(), id, month)
 	if err != nil {
@@ -305,4 +315,33 @@ func (h *WorkerHandler) GetWorkerSlots(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response.OK(w, slots)
+}
+
+// GroupSessionHistory returns all group agenda services assigned to the worker, ordered
+// by date descending. Used to display the professional's group session history.
+func (h *WorkerHandler) GroupSessionHistory(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		response.BadRequest(w, "INVALID_ID", "Invalid worker id")
+		return
+	}
+
+	claims := middleware.ClaimsFromContext(r.Context())
+	if middleware.IsCompanyWorkerRole(claims) {
+		if claims.WorkerID == nil || *claims.WorkerID != id {
+			response.Forbidden(w, "You can only view your own session history")
+			return
+		}
+	}
+
+	sessions, err := h.svc.GetWorkerGroupSessionHistory(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, appworker.ErrNotFound) {
+			response.NotFound(w, "WORKER_NOT_FOUND", "Worker not found")
+			return
+		}
+		response.InternalError(w)
+		return
+	}
+	response.OK(w, sessions)
 }

@@ -36,9 +36,13 @@ type Appointment struct {
 	FollowUpNotes    *string    `db:"follow_up_notes"    json:"follow_up_notes,omitempty"`
 	FollowUpDate     *time.Time `db:"follow_up_date"     json:"follow_up_date,omitempty"`
 	CareSessionID    *uuid.UUID `db:"care_session_id"    json:"care_session_id,omitempty"`
-	CreatedAt        time.Time  `db:"created_at"         json:"created_at"`
-	UpdatedAt        *time.Time `db:"updated_at"         json:"updated_at,omitempty"`
-	CreatedBy        *uuid.UUID `db:"created_by"         json:"created_by,omitempty"`
+	// Campos de plan de tratamiento (nullable para compatibilidad con citas independientes)
+	TreatmentPlanID *uuid.UUID `db:"treatment_plan_id" json:"treatment_plan_id,omitempty"`
+	SessionNumber   *int       `db:"session_number"    json:"session_number,omitempty"`
+	CountsAsSession bool       `db:"counts_as_session" json:"counts_as_session"`
+	CreatedAt       time.Time  `db:"created_at"        json:"created_at"`
+	UpdatedAt       *time.Time `db:"updated_at"        json:"updated_at,omitempty"`
+	CreatedBy       *uuid.UUID `db:"created_by"        json:"created_by,omitempty"`
 
 	// Enrichments (populated via JOIN, not real columns)
 	PatientName     *string `db:"patient_name"      json:"patient_name,omitempty"`
@@ -48,12 +52,13 @@ type Appointment struct {
 }
 
 type Filter struct {
-	PatientID *uuid.UUID
-	WorkerID  *uuid.UUID
-	CompanyID *uuid.UUID
-	Status    string
-	DateFrom  *time.Time
-	DateTo    *time.Time
+	PatientID       *uuid.UUID
+	WorkerID        *uuid.UUID
+	CompanyID       *uuid.UUID
+	TreatmentPlanID *uuid.UUID
+	Status          string
+	DateFrom        *time.Time
+	DateTo          *time.Time
 }
 
 type Repository interface {
@@ -64,4 +69,7 @@ type Repository interface {
 	Delete(ctx context.Context, id uuid.UUID) error
 	List(ctx context.Context, f Filter, limit, offset int) ([]*Appointment, int64, error)
 	HasWorkerConflict(ctx context.Context, workerID uuid.UUID, scheduledAt time.Time, durationMinutes int, excludeID *uuid.UUID) (bool, error)
+	// CountActiveSessions returns the number of non-terminal appointments linked to a treatment plan.
+	// Used by GenerateSessions to prevent duplicate generation.
+	CountActiveSessions(ctx context.Context, planID uuid.UUID) (int, error)
 }

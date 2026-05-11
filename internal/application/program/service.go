@@ -23,6 +23,7 @@ var (
 	ErrParticipantsOutsideCompany  = errors.New("one or more participants are not associated to agenda company")
 	ErrAgendaServiceWorkerRequired = errors.New("agenda service must have a worker assigned before completion")
 	ErrWorkerScheduleConflict      = errors.New("worker already has another booking in this time block")
+	ErrProgramHasCompletedSessions = errors.New("program has completed sessions and cannot be deleted")
 )
 
 type ScheduleRuleInput struct {
@@ -66,7 +67,7 @@ type CreateAgendaServiceRequest struct {
 
 type ParticipantInput struct {
 	PatientID  uuid.UUID `json:"patient_id"`
-	Attended   bool      `json:"attended"`
+	Attended   *bool     `json:"attended"`
 	AttendedAt *string   `json:"attended_at"`
 	Notes      *string   `json:"notes"`
 }
@@ -264,7 +265,7 @@ func (s *Service) UpdateProgram(ctx context.Context, id uuid.UUID, req UpdatePro
 	return p, nil
 }
 
-func (s *Service) ListPrograms(ctx context.Context, companyIDStr, contractIDStr, status, dateFrom, dateTo string, limit, offset int) ([]*program.CompanyProgram, int64, error) {
+func (s *Service) ListPrograms(ctx context.Context, companyIDStr, contractIDStr, workerIDStr, status, dateFrom, dateTo string, limit, offset int) ([]*program.CompanyProgram, int64, error) {
 	f := program.Filter{}
 	if companyIDStr != "" {
 		if id, err := uuid.Parse(companyIDStr); err == nil {
@@ -274,6 +275,11 @@ func (s *Service) ListPrograms(ctx context.Context, companyIDStr, contractIDStr,
 	if contractIDStr != "" {
 		if id, err := uuid.Parse(contractIDStr); err == nil {
 			f.ContractID = &id
+		}
+	}
+	if workerIDStr != "" {
+		if id, err := uuid.Parse(workerIDStr); err == nil {
+			f.WorkerID = &id
 		}
 	}
 	if status != "" {
@@ -391,7 +397,7 @@ func (s *Service) CompleteAgendaService(ctx context.Context, agendaServiceID uui
 	attended := make([]*program.AgendaServiceParticipant, 0)
 	ids := make([]uuid.UUID, 0)
 	for _, p := range participants {
-		if p.Attended {
+		if p.Attended != nil && *p.Attended {
 			attended = append(attended, p)
 			ids = append(ids, p.PatientID)
 		}
@@ -536,6 +542,21 @@ func (s *Service) GetAgendaServices(ctx context.Context, agendaID uuid.UUID) ([]
 	return s.repo.ListAgendaServices(ctx, agendaID)
 }
 
+// GetAgendaServiceByID returns a single agenda service by ID.
+func (s *Service) GetAgendaServiceByID(ctx context.Context, id uuid.UUID) (*program.AgendaService, error) {
+	svc, err := s.repo.GetAgendaServiceByID(ctx, id)
+	if err != nil {
+		return nil, ErrAgendaServiceNotFound
+	}
+	return svc, nil
+}
+
+// IsWorkerLinkedToProgram delegates to the repo to check whether a worker is associated
+// with a program via schedule rules or agenda services.
+func (s *Service) IsWorkerLinkedToProgram(ctx context.Context, programID, workerID uuid.UUID) (bool, error) {
+	return s.repo.IsWorkerLinkedToProgram(ctx, programID, workerID)
+}
+
 // GetParticipantsDetail returns participants for a service, enriched with patient names.
 func (s *Service) GetParticipantsDetail(ctx context.Context, agendaServiceID uuid.UUID) ([]*program.ParticipantDetail, error) {
 	return s.repo.ListParticipantsDetail(ctx, agendaServiceID)
@@ -552,25 +573,38 @@ func (s *Service) GenerateAgendas(ctx context.Context, programID uuid.UUID, by u
 		return 0, []uuid.UUID{}, nil
 	}
 
-	endDate := p.EndDate
-	if endDate == nil {
-		// Default to 1 year from start if no end is set
-		d := p.StartDate.AddDate(1, 0, 0)
-		endDate = &d
-	}
-
-	ct, err := s.contractRepo.FindByID(ctx, p.ContractID)
+	endDate, err := s.resolveEndDate(ctx, p)
 	if err != nil {
-		return 0, nil, ErrContractNotFound
-	}
-	if clippedEnd := effectiveProgramWindowEnd(endDate, ct.EndDate); clippedEnd != nil {
-		endDate = clippedEnd
+		return 0, nil, err
 	}
 	if endDate != nil && endDate.Before(p.StartDate) {
 		return 0, []uuid.UUID{}, nil
 	}
 
-	existingAgendas, err := s.repo.ListProgramAgendas(ctx, p.ID)
+	return s.computeAndInsertAgendas(ctx, s.repo, p, rules, endDate, by)
+}
+
+// resolveEndDate returns the effective end date for the program, clipped to the contract's end date.
+func (s *Service) resolveEndDate(ctx context.Context, p *program.CompanyProgram) (*time.Time, error) {
+	endDate := p.EndDate
+	if endDate == nil {
+		d := p.StartDate.AddDate(1, 0, 0)
+		endDate = &d
+	}
+	ct, err := s.contractRepo.FindByID(ctx, p.ContractID)
+	if err != nil {
+		return nil, ErrContractNotFound
+	}
+	if clippedEnd := effectiveProgramWindowEnd(endDate, ct.EndDate); clippedEnd != nil {
+		endDate = clippedEnd
+	}
+	return endDate, nil
+}
+
+// computeAndInsertAgendas iterates over schedule rules, computes occurrences, and inserts agendas +
+// services using the provided repo (which may be a tx-backed repo for atomic operations).
+func (s *Service) computeAndInsertAgendas(ctx context.Context, repo program.Repository, p *program.CompanyProgram, rules []*program.ScheduleRule, endDate *time.Time, by uuid.UUID) (int, []uuid.UUID, error) {
+	existingAgendas, err := repo.ListProgramAgendas(ctx, p.ID)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -609,7 +643,7 @@ func (s *Service) GenerateAgendas(ctx context.Context, programID uuid.UUID, by u
 			if rule.ServiceTypeID != nil {
 				workerID := rule.WorkerID
 				if workerID != nil {
-					conflict, err := s.repo.HasWorkerScheduleConflict(ctx, *workerID, date, startStr, rule.DurationMinutes, nil)
+					conflict, err := repo.HasWorkerScheduleConflict(ctx, *workerID, date, startStr, rule.DurationMinutes, nil)
 					if err != nil || conflict {
 						continue
 					}
@@ -618,11 +652,11 @@ func (s *Service) GenerateAgendas(ctx context.Context, programID uuid.UUID, by u
 				slotKey := agendaSlotKey(date, &startStr)
 				agendaID, ok := agendaBySlot[slotKey]
 				if !ok {
-					agendaID, err = s.repo.CreateAgenda(ctx, p.CompanyID, &p.ContractID, date, &startStr, by)
+					agendaID, err = repo.CreateAgenda(ctx, p.CompanyID, &p.ContractID, date, &startStr, by)
 					if err != nil {
 						continue // skip failures so other occurrences can still be generated
 					}
-					if err := s.repo.LinkProgramAgenda(ctx, p.ID, agendaID); err != nil {
+					if err := repo.LinkProgramAgenda(ctx, p.ID, agendaID); err != nil {
 						continue
 					}
 					agendaBySlot[slotKey] = agendaID
@@ -632,7 +666,7 @@ func (s *Service) GenerateAgendas(ctx context.Context, programID uuid.UUID, by u
 
 				signature := agendaServiceKey(*rule.ServiceTypeID, workerID, &startStr, &rule.DurationMinutes)
 				if existingServiceID, exists := serviceByAgenda[agendaID][signature]; exists {
-					_ = s.seedCompanyParticipants(ctx, existingServiceID, nil)
+					_ = s.seedCompanyParticipantsWithRepo(ctx, repo, existingServiceID, nil)
 					continue
 				}
 				svc := &program.AgendaService{
@@ -644,8 +678,8 @@ func (s *Service) GenerateAgendas(ctx context.Context, programID uuid.UUID, by u
 					PlannedDurationMinutes: &rule.DurationMinutes,
 					Status:                 program.AgendaServicePlanned,
 				}
-				if err := s.repo.CreateAgendaServices(ctx, []*program.AgendaService{svc}); err == nil {
-					_ = s.seedCompanyParticipants(ctx, svc.ID, nil)
+				if err := repo.CreateAgendaServices(ctx, []*program.AgendaService{svc}); err == nil {
+					_ = s.seedCompanyParticipantsWithRepo(ctx, repo, svc.ID, nil)
 					serviceByAgenda[agendaID][signature] = svc.ID
 				}
 				continue
@@ -655,11 +689,11 @@ func (s *Service) GenerateAgendas(ctx context.Context, programID uuid.UUID, by u
 			if _, ok := agendaBySlot[slotKey]; ok {
 				continue
 			}
-			agendaID, err := s.repo.CreateAgenda(ctx, p.CompanyID, &p.ContractID, date, &startStr, by)
+			agendaID, err := repo.CreateAgenda(ctx, p.CompanyID, &p.ContractID, date, &startStr, by)
 			if err != nil {
 				continue
 			}
-			if err := s.repo.LinkProgramAgenda(ctx, p.ID, agendaID); err != nil {
+			if err := repo.LinkProgramAgenda(ctx, p.ID, agendaID); err != nil {
 				continue
 			}
 			agendaBySlot[slotKey] = agendaID
@@ -670,12 +704,88 @@ func (s *Service) GenerateAgendas(ctx context.Context, programID uuid.UUID, by u
 	return len(created), created, nil
 }
 
-func (s *Service) seedCompanyParticipants(ctx context.Context, agendaServiceID uuid.UUID, createdBy *uuid.UUID) error {
-	ctxData, err := s.repo.GetAgendaContextByServiceID(ctx, agendaServiceID)
+// RegenerateAgendas clears all pending (non-completed) agendas for the program
+// and then generates fresh agendas from the current schedule rules, all within
+// a single DB transaction so the two operations are atomic.
+func (s *Service) RegenerateAgendas(ctx context.Context, programID uuid.UUID, by uuid.UUID) (int, []uuid.UUID, error) {
+	// Pre-read program, rules, and contract outside the transaction — these are
+	// read-only lookups and do not need to be part of the write transaction.
+	p, rules, err := s.GetProgramByID(ctx, programID)
+	if err != nil {
+		return 0, nil, ErrProgramNotFound
+	}
+	if len(rules) == 0 {
+		// Nothing to generate; still clear stale agendas, but no tx needed.
+		if _, err := s.repo.ClearPendingAgendas(ctx, programID); err != nil {
+			return 0, nil, err
+		}
+		return 0, []uuid.UUID{}, nil
+	}
+
+	endDate, err := s.resolveEndDate(ctx, p)
+	if err != nil {
+		return 0, nil, err
+	}
+	if endDate != nil && endDate.Before(p.StartDate) {
+		if _, err := s.repo.ClearPendingAgendas(ctx, programID); err != nil {
+			return 0, nil, err
+		}
+		return 0, []uuid.UUID{}, nil
+	}
+
+	var count int
+	var ids []uuid.UUID
+	txErr := s.repo.Transact(ctx, func(txRepo program.Repository) error {
+		if _, err := txRepo.ClearPendingAgendas(ctx, programID); err != nil {
+			return err
+		}
+		n, created, err := s.computeAndInsertAgendas(ctx, txRepo, p, rules, endDate, by)
+		if err != nil {
+			return err
+		}
+		count = n
+		ids = created
+		return nil
+	})
+	return count, ids, txErr
+}
+
+// DeleteProgram removes a program and all of its associated data. It refuses
+// to delete if any agenda service linked to the program is already completed,
+// to protect historical care-session records.
+func (s *Service) DeleteProgram(ctx context.Context, programID uuid.UUID) error {
+	// Verify the program exists
+	if _, err := s.repo.GetProgramByID(ctx, programID); err != nil {
+		return ErrProgramNotFound
+	}
+
+	// Check for completed sessions before deleting
+	agendas, err := s.repo.ListProgramAgendas(ctx, programID)
 	if err != nil {
 		return err
 	}
-	patientIDs, err := s.repo.ListCompanyPatientIDs(ctx, ctxData.CompanyID)
+	for _, agenda := range agendas {
+		for _, svc := range agenda.Services {
+			if svc.Status == program.AgendaServiceCompleted {
+				return ErrProgramHasCompletedSessions
+			}
+		}
+	}
+
+	return s.repo.DeleteProgram(ctx, programID)
+}
+
+func (s *Service) seedCompanyParticipants(ctx context.Context, agendaServiceID uuid.UUID, createdBy *uuid.UUID) error {
+	return s.seedCompanyParticipantsWithRepo(ctx, s.repo, agendaServiceID, createdBy)
+}
+
+// seedCompanyParticipantsWithRepo is the repo-injected variant used inside transactions.
+func (s *Service) seedCompanyParticipantsWithRepo(ctx context.Context, repo program.Repository, agendaServiceID uuid.UUID, createdBy *uuid.UUID) error {
+	ctxData, err := repo.GetAgendaContextByServiceID(ctx, agendaServiceID)
+	if err != nil {
+		return err
+	}
+	patientIDs, err := repo.ListCompanyPatientIDs(ctx, ctxData.CompanyID)
 	if err != nil {
 		return err
 	}
@@ -689,11 +799,11 @@ func (s *Service) seedCompanyParticipants(ctx context.Context, agendaServiceID u
 			ID:              uuid.New(),
 			AgendaServiceID: agendaServiceID,
 			PatientID:       patientID,
-			Attended:        false,
+			Attended:        nil, // not yet recorded
 			CreatedBy:       createdBy,
 		})
 	}
-	return s.repo.UpsertParticipants(ctx, items)
+	return repo.UpsertParticipants(ctx, items)
 }
 
 // occurrences returns all dates matching weekday (0=Sun) from start to end, stepping by freqWeeks weeks.
@@ -767,4 +877,9 @@ func agendaServiceKey(serviceTypeID uuid.UUID, workerID *uuid.UUID, start *strin
 		durationValue = *duration
 	}
 	return fmt.Sprintf("%s|%s|%s|%d", serviceTypeID.String(), workerValue, startValue, durationValue)
+}
+
+// GetPatientParticipation returns all group program sessions a patient has been enrolled in.
+func (s *Service) GetPatientParticipation(ctx context.Context, patientID uuid.UUID) ([]*program.PatientProgramParticipation, error) {
+	return s.repo.ListPatientParticipation(ctx, patientID)
 }

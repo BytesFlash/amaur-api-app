@@ -15,16 +15,22 @@ type SpecialtyItem struct {
 
 // ApptSummary is a lightweight view of an appointment used in calendar responses.
 type ApptSummary struct {
-	AppointmentID   *uuid.UUID `json:"appointment_id,omitempty"`
-	PatientID       *uuid.UUID `json:"patient_id,omitempty"`
-	ServiceTypeID   *uuid.UUID `json:"service_type_id,omitempty"`
-	PatientName     string     `json:"patient_name,omitempty"`
-	ServiceTypeName string     `json:"service_type_name,omitempty"`
-	ScheduledAt     string     `json:"scheduled_at"` // "HH:MM"
-	DurationMinutes int        `json:"duration_minutes"`
-	Type            string     `json:"type"`  // "individual" | "group"
-	Label           string     `json:"label"` // patient/company name or service type
-	Status          string     `json:"status,omitempty"`
+	AppointmentID    *uuid.UUID `json:"appointment_id,omitempty"`
+	AgendaServiceID  *uuid.UUID `json:"agenda_service_id,omitempty"` // set for type="group"
+	PatientID        *uuid.UUID `json:"patient_id,omitempty"`
+	ServiceTypeID    *uuid.UUID `json:"service_type_id,omitempty"`
+	PatientName      string     `json:"patient_name,omitempty"`
+	ServiceTypeName  string     `json:"service_type_name,omitempty"`
+	ProgramName      string     `json:"program_name,omitempty"`      // set for type="group"
+	CompanyName      string     `json:"company_name,omitempty"`      // set for type="group"
+	ParticipantCount *int       `json:"participant_count,omitempty"` // set for type="group"
+	TreatmentPlanID  *uuid.UUID `json:"treatment_plan_id,omitempty"` // set for individual appointments linked to a plan
+	SessionNumber    *int       `json:"session_number,omitempty"`    // session number within the treatment plan
+	ScheduledAt      string     `json:"scheduled_at"` // "HH:MM"
+	DurationMinutes  int        `json:"duration_minutes"`
+	Type             string     `json:"type"`  // "individual" | "group"
+	Label            string     `json:"label"` // patient/company name or service type
+	Status           string     `json:"status,omitempty"`
 }
 
 // DayCalendar summarises availability and bookings for a single calendar day.

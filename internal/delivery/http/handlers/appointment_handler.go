@@ -47,6 +47,15 @@ func (h *AppointmentHandler) List(w http.ResponseWriter, r *http.Request) {
 		}
 		companyID = claims.CompanyID.String()
 	}
+	// Worker scoping: professionals only see their own appointments in the
+	// general list. When a patient_id is explicitly provided (e.g. viewing a
+	// patient's full appointment history), the worker filter is not applied so
+	// the professional can see all appointments for that patient.
+	// Mutations (Update/Delete) remain scoped via getScopedAppointment.
+	// super_admin bypasses this restriction entirely.
+	if claims.WorkerID != nil && !claims.HasRole("super_admin") && patientID == "" {
+		workerID = claims.WorkerID.String()
+	}
 
 	items, total, err := h.svc.List(r.Context(), patientID, workerID, companyID, status, dateFrom, dateTo, p.Limit, p.Offset)
 	if err != nil {
@@ -62,6 +71,7 @@ func (h *AppointmentHandler) Create(w http.ResponseWriter, r *http.Request) {
 		response.BadRequest(w, "INVALID_BODY", "Invalid request body")
 		return
 	}
+
 	claims := middleware.ClaimsFromContext(r.Context())
 	if middleware.IsPatientScopedRole(claims) {
 		if claims.PatientID == nil {
@@ -77,6 +87,12 @@ func (h *AppointmentHandler) Create(w http.ResponseWriter, r *http.Request) {
 		}
 		req.CompanyID = claims.CompanyID
 	}
+	// If the requesting professional has a linked worker profile and didn't
+	// explicitly set a worker, default to themselves.
+	if req.WorkerID == nil && claims.WorkerID != nil {
+		req.WorkerID = claims.WorkerID
+	}
+
 	items, err := h.svc.Create(r.Context(), req, claims.UserID)
 	if err != nil {
 		switch {
@@ -106,7 +122,7 @@ func (h *AppointmentHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 		response.BadRequest(w, "INVALID_ID", "Invalid appointment id")
 		return
 	}
-	item, ok := h.getScopedAppointment(w, r, id)
+	item, ok := h.getAnyAppointment(w, r, id)
 	if !ok {
 		return
 	}
@@ -130,31 +146,22 @@ func (h *AppointmentHandler) Update(w http.ResponseWriter, r *http.Request) {
 	claims := middleware.ClaimsFromContext(r.Context())
 	item, err := h.svc.Update(r.Context(), id, req, claims.UserID)
 	if err != nil {
-		if errors.Is(err, appappt.ErrNotFound) {
+		switch {
+		case errors.Is(err, appappt.ErrNotFound):
 			response.NotFound(w, "APPOINTMENT_NOT_FOUND", "Appointment not found")
-			return
-		}
-		if errors.Is(err, appappt.ErrInvalidDate) {
+		case errors.Is(err, appappt.ErrInvalidDate):
 			response.BadRequest(w, "INVALID_DATE", err.Error())
-			return
-		}
-		if errors.Is(err, appappt.ErrInvalidStatus) {
+		case errors.Is(err, appappt.ErrInvalidStatus):
 			response.BadRequest(w, "INVALID_STATUS", err.Error())
-			return
-		}
-		if errors.Is(err, appappt.ErrTooSoon) {
+		case errors.Is(err, appappt.ErrTooSoon):
 			response.BadRequest(w, "TIME_TOO_SOON", err.Error())
-			return
-		}
-		if errors.Is(err, appappt.ErrOutsideAvailability) {
+		case errors.Is(err, appappt.ErrOutsideAvailability):
 			response.BadRequest(w, "OUTSIDE_AVAILABILITY", err.Error())
-			return
-		}
-		if errors.Is(err, appappt.ErrWorkerBusy) {
+		case errors.Is(err, appappt.ErrWorkerBusy):
 			response.Conflict(w, "WORKER_BUSY", err.Error())
-			return
+		default:
+			response.InternalError(w)
 		}
-		response.InternalError(w)
 		return
 	}
 	response.OK(w, item)
@@ -180,13 +187,14 @@ func (h *AppointmentHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	response.NoContent(w)
 }
 
-func (h *AppointmentHandler) getScopedAppointment(w http.ResponseWriter, r *http.Request, id uuid.UUID) (*domainappt.Appointment, bool) {
+// getAnyAppointment fetches an appointment enforcing patient/company scope,
+// but does NOT restrict workers to their own appointments (read-only use).
+func (h *AppointmentHandler) getAnyAppointment(w http.ResponseWriter, r *http.Request, id uuid.UUID) (*domainappt.Appointment, bool) {
 	item, err := h.svc.GetByID(r.Context(), id)
 	if err != nil {
 		response.NotFound(w, "APPOINTMENT_NOT_FOUND", "Appointment not found")
 		return nil, false
 	}
-
 	claims := middleware.ClaimsFromContext(r.Context())
 	if middleware.IsPatientScopedRole(claims) {
 		if claims.PatientID == nil {
@@ -208,6 +216,44 @@ func (h *AppointmentHandler) getScopedAppointment(w http.ResponseWriter, r *http
 			return nil, false
 		}
 	}
+	return item, true
+}
 
+// getScopedAppointment fetches an appointment and enforces full ownership including
+// worker scope. Used by Update and Delete to prevent professionals from mutating
+// appointments they are not assigned to.
+func (h *AppointmentHandler) getScopedAppointment(w http.ResponseWriter, r *http.Request, id uuid.UUID) (*domainappt.Appointment, bool) {
+	item, err := h.svc.GetByID(r.Context(), id)
+	if err != nil {
+		response.NotFound(w, "APPOINTMENT_NOT_FOUND", "Appointment not found")
+		return nil, false
+	}
+	claims := middleware.ClaimsFromContext(r.Context())
+	if middleware.IsPatientScopedRole(claims) {
+		if claims.PatientID == nil {
+			response.Forbidden(w, "Missing patient scope")
+			return nil, false
+		}
+		if item.PatientID != *claims.PatientID {
+			response.Forbidden(w, "You do not have access to this appointment")
+			return nil, false
+		}
+	}
+	if middleware.IsCompanyScopedRole(claims) {
+		if claims.CompanyID == nil {
+			response.Forbidden(w, "Missing company scope")
+			return nil, false
+		}
+		if item.CompanyID == nil || *item.CompanyID != *claims.CompanyID {
+			response.Forbidden(w, "You do not have access to this appointment")
+			return nil, false
+		}
+	}
+	if claims.WorkerID != nil && !claims.HasRole("super_admin") {
+		if item.WorkerID == nil || *item.WorkerID != *claims.WorkerID {
+			response.Forbidden(w, "You do not have access to this appointment")
+			return nil, false
+		}
+	}
 	return item, true
 }

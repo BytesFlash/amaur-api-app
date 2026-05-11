@@ -8,6 +8,7 @@ import (
 	appcssession "amaur/api/internal/application/caresession"
 	"amaur/api/internal/delivery/http/middleware"
 	"amaur/api/internal/delivery/http/response"
+	domaincss "amaur/api/internal/domain/caresession"
 	"amaur/api/pkg/pagination"
 
 	"github.com/go-chi/chi/v5"
@@ -43,8 +44,17 @@ func (h *CareSessionHandler) List(w http.ResponseWriter, r *http.Request) {
 		}
 		patientID = claims.PatientID.String()
 	}
+	// Worker scoping: professionals only see their own sessions UNLESS a patient_id
+	// is provided, in which case they can view the full history of that patient
+	// (including sessions from other professionals). Mutations are still restricted
+	// to the owning professional via getScopedCareSession.
+	// super_admin bypasses this restriction entirely.
+	workerID := q.Get("worker_id")
+	if claims.WorkerID != nil && !claims.HasRole("super_admin") && patientID == "" {
+		workerID = claims.WorkerID.String()
+	}
 	items, total, err := h.svc.List(r.Context(),
-		patientID, q.Get("worker_id"), companyID,
+		patientID, workerID, companyID,
 		q.Get("visit_id"), q.Get("session_type"), q.Get("status"),
 		q.Get("date_from"), q.Get("date_to"),
 		p.Limit, p.Offset)
@@ -96,7 +106,40 @@ func (h *CareSessionHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Workers (professionals) can view any care session — they should see the full
+	// patient history regardless of which professional created the session.
+	// Ownership is enforced only on mutations (PATCH/DELETE) via getScopedCareSession.
 	response.OK(w, cs)
+}
+
+// getScopedCareSession loads a care session and enforces ownership for worker-scoped users.
+// Returns (session, true) on success or writes the error response and returns (nil, false).
+func (h *CareSessionHandler) getScopedCareSession(w http.ResponseWriter, r *http.Request, id uuid.UUID) (*domaincss.CareSession, bool) {
+	cs, err := h.svc.GetByID(r.Context(), id)
+	if err != nil {
+		response.NotFound(w, "NOT_FOUND", "Care session not found")
+		return nil, false
+	}
+	claims := middleware.ClaimsFromContext(r.Context())
+	if middleware.IsCompanyScopedRole(claims) {
+		if claims.CompanyID == nil || cs.CompanyID == nil || *cs.CompanyID != *claims.CompanyID {
+			response.Forbidden(w, "You do not have access to this care session")
+			return nil, false
+		}
+	}
+	if middleware.IsPatientScopedRole(claims) {
+		if claims.PatientID == nil || cs.PatientID != *claims.PatientID {
+			response.Forbidden(w, "You do not have access to this care session")
+			return nil, false
+		}
+	}
+	if claims.WorkerID != nil && !claims.HasRole("super_admin") {
+		if cs.WorkerID != *claims.WorkerID {
+			response.Forbidden(w, "You do not have access to this care session")
+			return nil, false
+		}
+	}
+	return cs, true
 }
 
 // PATCH /care-sessions/{id}
@@ -104,6 +147,9 @@ func (h *CareSessionHandler) Update(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
 		response.BadRequest(w, "INVALID_ID", "Invalid care session id")
+		return
+	}
+	if _, ok := h.getScopedCareSession(w, r, id); !ok {
 		return
 	}
 	var req appcssession.UpdateCareSessionRequest
@@ -129,6 +175,9 @@ func (h *CareSessionHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
 		response.BadRequest(w, "INVALID_ID", "Invalid care session id")
+		return
+	}
+	if _, ok := h.getScopedCareSession(w, r, id); !ok {
 		return
 	}
 	if err := h.svc.Delete(r.Context(), id); err != nil {

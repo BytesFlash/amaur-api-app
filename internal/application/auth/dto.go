@@ -27,6 +27,7 @@ type UserDTO struct {
 	Email       string     `json:"email"`
 	CompanyID   *uuid.UUID `json:"company_id,omitempty"`
 	PatientID   *uuid.UUID `json:"patient_id,omitempty"`
+	WorkerID    *uuid.UUID `json:"worker_id,omitempty"`
 	FirstName   string     `json:"first_name"`
 	LastName    string     `json:"last_name"`
 	Roles       []string   `json:"roles"`

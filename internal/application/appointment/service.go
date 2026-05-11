@@ -6,7 +6,9 @@ import (
 	"time"
 
 	"amaur/api/internal/domain/appointment"
+	"amaur/api/internal/domain/caresession"
 	"amaur/api/internal/domain/program"
+	"amaur/api/internal/domain/treatmentplan"
 	"amaur/api/internal/domain/worker"
 	"amaur/api/pkg/timeutil"
 
@@ -28,7 +30,7 @@ type CreateAppointmentRequest struct {
 	WorkerID         *uuid.UUID `json:"worker_id"`
 	ServiceTypeID    uuid.UUID  `json:"service_type_id"`
 	CompanyID        *uuid.UUID `json:"company_id"`
-	ScheduledAt      string     `json:"scheduled_at"` // RFC3339 or "YYYY-MM-DDTHH:MM"
+	ScheduledAt      string     `json:"scheduled_at"`
 	DurationMinutes  *int       `json:"duration_minutes"`
 	Notes            *string    `json:"notes"`
 	ChiefComplaint   *string    `json:"chief_complaint"`
@@ -38,10 +40,13 @@ type CreateAppointmentRequest struct {
 	Plan             *string    `json:"plan"`
 	FollowUpRequired *bool      `json:"follow_up_required"`
 	FollowUpNotes    *string    `json:"follow_up_notes"`
-	FollowUpDate     *string    `json:"follow_up_date"` // YYYY-MM-DD
-	// Recurring booking
-	SessionCount   int `json:"session_count"`   // 1 = single, >1 = batch
-	FrequencyWeeks int `json:"frequency_weeks"` // 1=weekly, 2=biweekly
+	FollowUpDate     *string    `json:"follow_up_date"`
+	SessionCount     int        `json:"session_count"`
+	FrequencyWeeks   int        `json:"frequency_weeks"`
+	// Campos opcionales de plan de tratamiento
+	TreatmentPlanID *uuid.UUID `json:"treatment_plan_id"`
+	SessionNumber   *int       `json:"session_number"`
+	CountsAsSession *bool      `json:"counts_as_session"`
 }
 
 type UpdateAppointmentRequest struct {
@@ -58,13 +63,15 @@ type UpdateAppointmentRequest struct {
 	Plan             *string    `json:"plan"`
 	FollowUpRequired *bool      `json:"follow_up_required"`
 	FollowUpNotes    *string    `json:"follow_up_notes"`
-	FollowUpDate     *string    `json:"follow_up_date"` // YYYY-MM-DD
+	FollowUpDate     *string    `json:"follow_up_date"`
 }
 
 type Service struct {
-	repo        appointment.Repository
-	programRepo program.Repository
-	workerRepo  worker.Repository
+	repo              appointment.Repository
+	programRepo       program.Repository
+	workerRepo        worker.Repository
+	careSessionRepo   caresession.Repository
+	treatmentPlanRepo treatmentplan.Repository
 }
 
 func NewService(repo appointment.Repository) *Service {
@@ -81,13 +88,21 @@ func (s *Service) WithWorkerRepo(r worker.Repository) *Service {
 	return s
 }
 
-// Create creates one or more appointments (recurring if SessionCount > 1).
+func (s *Service) WithCareSessionRepo(r caresession.Repository) *Service {
+	s.careSessionRepo = r
+	return s
+}
+
+func (s *Service) WithTreatmentPlanRepo(r treatmentplan.Repository) *Service {
+	s.treatmentPlanRepo = r
+	return s
+}
+
 func (s *Service) Create(ctx context.Context, req CreateAppointmentRequest, by uuid.UUID) ([]*appointment.Appointment, error) {
 	first, err := parseScheduledAt(req.ScheduledAt)
 	if err != nil {
 		return nil, ErrInvalidDate
 	}
-
 	count := req.SessionCount
 	if count < 1 {
 		count = 1
@@ -95,18 +110,15 @@ func (s *Service) Create(ctx context.Context, req CreateAppointmentRequest, by u
 	if count > 52 {
 		return nil, ErrInvalidRecurrence
 	}
-
 	freqWeeks := req.FrequencyWeeks
 	if freqWeeks < 1 {
 		freqWeeks = 1
 	}
-
 	var groupID *uuid.UUID
 	if count > 1 {
 		g := uuid.New()
 		groupID = &g
 	}
-
 	batch := make([]*appointment.Appointment, 0, count)
 	for i := 0; i < count; i++ {
 		scheduledAt := first.AddDate(0, 0, i*freqWeeks*7)
@@ -123,14 +135,7 @@ func (s *Service) Create(ctx context.Context, req CreateAppointmentRequest, by u
 				return nil, ErrWorkerBusy
 			}
 			if s.programRepo != nil {
-				groupOccupied, err := s.programRepo.HasWorkerScheduleConflict(
-					ctx,
-					*req.WorkerID,
-					scheduledAt,
-					scheduledAt.Format("15:04"),
-					duration,
-					nil,
-				)
+				groupOccupied, err := s.programRepo.HasWorkerScheduleConflict(ctx, *req.WorkerID, scheduledAt, scheduledAt.Format("15:04"), duration, nil)
 				if err != nil {
 					return nil, err
 				}
@@ -158,14 +163,15 @@ func (s *Service) Create(ctx context.Context, req CreateAppointmentRequest, by u
 			FollowUpRequired: coalesceBool(req.FollowUpRequired),
 			FollowUpNotes:    req.FollowUpNotes,
 			FollowUpDate:     parseDateOnlyPtr(req.FollowUpDate),
+			TreatmentPlanID:  req.TreatmentPlanID,
+			SessionNumber:    req.SessionNumber,
+			CountsAsSession:  coalesceBoolDefault(req.CountsAsSession, true),
 			CreatedBy:        &by,
 		})
 	}
-
 	if err := s.repo.CreateBatch(ctx, batch); err != nil {
 		return nil, err
 	}
-
 	created := make([]*appointment.Appointment, 0, len(batch))
 	for _, item := range batch {
 		enriched, err := s.repo.FindByID(ctx, item.ID)
@@ -174,7 +180,6 @@ func (s *Service) Create(ctx context.Context, req CreateAppointmentRequest, by u
 		}
 		created = append(created, enriched)
 	}
-
 	return created, nil
 }
 
@@ -242,7 +247,11 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, req UpdateAppointmen
 	if req.FollowUpDate != nil {
 		a.FollowUpDate = parseDateOnlyPtr(req.FollowUpDate)
 	}
-	if a.WorkerID != nil {
+	// Run scheduling checks only when the time slot or assigned worker changes.
+	// A status-only update (e.g. confirmed → completed) must not be blocked by
+	// ErrTooSoon or availability rules — those validations are for scheduling.
+	schedulingChanged := req.ScheduledAt != nil || req.WorkerID != nil
+	if schedulingChanged && a.WorkerID != nil {
 		duration := coalesceDuration(a.DurationMinutes)
 		if err := s.ensureWorkerSlotAllowed(ctx, *a.WorkerID, a.ScheduledAt, duration); err != nil {
 			return nil, err
@@ -255,14 +264,7 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, req UpdateAppointmen
 			return nil, ErrWorkerBusy
 		}
 		if s.programRepo != nil {
-			groupOccupied, err := s.programRepo.HasWorkerScheduleConflict(
-				ctx,
-				*a.WorkerID,
-				a.ScheduledAt,
-				a.ScheduledAt.Format("15:04"),
-				duration,
-				nil,
-			)
+			groupOccupied, err := s.programRepo.HasWorkerScheduleConflict(ctx, *a.WorkerID, a.ScheduledAt, a.ScheduledAt.Format("15:04"), duration, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -272,8 +274,25 @@ func (s *Service) Update(ctx context.Context, id uuid.UUID, req UpdateAppointmen
 		}
 	}
 	a.UpdatedAt = &now
+	// Auto-create a linked care session when an appointment is completed for the first time.
+	if s.careSessionRepo != nil &&
+		a.CareSessionID == nil &&
+		a.Status == appointment.StatusCompleted &&
+		a.WorkerID != nil {
+		if cs, csErr := s.createCareSessionFromAppointment(ctx, a, by); csErr == nil {
+			a.CareSessionID = &cs.ID
+		}
+	}
 	if err := s.repo.Update(ctx, a); err != nil {
 		return nil, err
+	}
+	// Recalculate completed_sessions on the linked treatment plan whenever
+	// a session-counting appointment reaches a terminal status.
+	if s.treatmentPlanRepo != nil &&
+		a.TreatmentPlanID != nil &&
+		a.CountsAsSession &&
+		(a.Status == appointment.StatusCompleted || a.Status == appointment.StatusNoShow || a.Status == appointment.StatusCancelled) {
+		_ = s.treatmentPlanRepo.RecalculateCompleted(ctx, *a.TreatmentPlanID)
 	}
 	return a, nil
 }
@@ -372,6 +391,49 @@ func coalesceBool(value *bool) bool {
 	return *value
 }
 
+// coalesceBoolDefault retorna *value si está definido, o defaultVal si es nil.
+func coalesceBoolDefault(value *bool, defaultVal bool) bool {
+	if value == nil {
+		return defaultVal
+	}
+	return *value
+}
+
+func (s *Service) createCareSessionFromAppointment(ctx context.Context, a *appointment.Appointment, by uuid.UUID) (*caresession.CareSession, error) {
+	local := a.ScheduledAt.In(timeutil.Santiago())
+	sessionDate := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, time.UTC)
+	sessionTimeStr := local.Format("15:04")
+	sessionType := "particular"
+	if a.CompanyID != nil {
+		sessionType = "company_visit"
+	}
+	cs := &caresession.CareSession{
+		PatientID:        a.PatientID,
+		WorkerID:         *a.WorkerID,
+		ServiceTypeID:    a.ServiceTypeID,
+		CompanyID:        a.CompanyID,
+		SessionType:      sessionType,
+		SessionDate:      sessionDate,
+		SessionTime:      &sessionTimeStr,
+		DurationMinutes:  a.DurationMinutes,
+		Status:           "completed",
+		ChiefComplaint:   a.ChiefComplaint,
+		Subjective:       a.Subjective,
+		Objective:        a.Objective,
+		Assessment:       a.Assessment,
+		Plan:             a.Plan,
+		Notes:            a.Notes,
+		FollowUpRequired: a.FollowUpRequired,
+		FollowUpDate:     a.FollowUpDate,
+		FollowUpNotes:    a.FollowUpNotes,
+		CreatedBy:        &by,
+	}
+	if err := s.careSessionRepo.Create(ctx, cs); err != nil {
+		return nil, err
+	}
+	return cs, nil
+}
+
 func (s *Service) autoCompleteIfExpired(ctx context.Context, item *appointment.Appointment) error {
 	if item == nil || item.Status != appointment.StatusInProgress {
 		return nil
@@ -425,26 +487,8 @@ func isWithinAvailability(rules []*worker.AvailabilityRule, scheduledAt time.Tim
 		if err != nil {
 			continue
 		}
-		ruleStart := time.Date(
-			scheduledAt.Year(),
-			scheduledAt.Month(),
-			scheduledAt.Day(),
-			ruleStartTime.Hour(),
-			ruleStartTime.Minute(),
-			0,
-			0,
-			scheduledAt.Location(),
-		)
-		ruleEnd := time.Date(
-			scheduledAt.Year(),
-			scheduledAt.Month(),
-			scheduledAt.Day(),
-			ruleEndTime.Hour(),
-			ruleEndTime.Minute(),
-			0,
-			0,
-			scheduledAt.Location(),
-		)
+		ruleStart := time.Date(scheduledAt.Year(), scheduledAt.Month(), scheduledAt.Day(), ruleStartTime.Hour(), ruleStartTime.Minute(), 0, 0, scheduledAt.Location())
+		ruleEnd := time.Date(scheduledAt.Year(), scheduledAt.Month(), scheduledAt.Day(), ruleEndTime.Hour(), ruleEndTime.Minute(), 0, 0, scheduledAt.Location())
 		if scheduledAt.Before(ruleStart) || slotEnd.After(ruleEnd) {
 			continue
 		}

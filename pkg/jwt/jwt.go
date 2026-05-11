@@ -13,6 +13,7 @@ type Claims struct {
 	Email       string     `json:"email"`
 	CompanyID   *uuid.UUID `json:"company_id,omitempty"`
 	PatientID   *uuid.UUID `json:"patient_id,omitempty"`
+	WorkerID    *uuid.UUID `json:"worker_id,omitempty"`
 	Roles       []string   `json:"roles"`
 	Permissions []string   `json:"permissions"`
 	jwt.RegisteredClaims
@@ -50,13 +51,14 @@ func NewManager(secret string, accessExpiry, refreshExpiry time.Duration) *Manag
 	}
 }
 
-func (m *Manager) GenerateAccessToken(userID uuid.UUID, email string, companyID *uuid.UUID, patientID *uuid.UUID, roles, permissions []string) (string, error) {
+func (m *Manager) GenerateAccessToken(userID uuid.UUID, email string, companyID *uuid.UUID, patientID *uuid.UUID, workerID *uuid.UUID, roles, permissions []string) (string, error) {
 	now := time.Now()
 	claims := Claims{
 		UserID:      userID,
 		Email:       email,
 		CompanyID:   companyID,
 		PatientID:   patientID,
+		WorkerID:    workerID,
 		Roles:       roles,
 		Permissions: permissions,
 		RegisteredClaims: jwt.RegisteredClaims{

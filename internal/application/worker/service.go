@@ -432,9 +432,15 @@ func (s *Service) GetWorkerCalendar(ctx context.Context, workerID uuid.UUID, mon
 
 	// Fetch group agenda services for the month.
 	type groupBlock struct {
-		startTime string
-		duration  int
-		label     string
+		agendaServiceID  uuid.UUID
+		startTime        string
+		duration         int
+		label            string
+		serviceTypeName  string
+		programName      string
+		companyName      string
+		participantCount *int
+		status           string
 	}
 	groupByDate := make(map[string][]groupBlock)
 	if s.programRepo != nil {
@@ -451,10 +457,29 @@ func (s *Service) GetWorkerCalendar(ctx context.Context, workerID uuid.UUID, mon
 					startT = *svc.PlannedStartTime
 				}
 				lbl := "Servicio grupal"
-				if svc.ServiceTypeName != nil {
+				stName := ""
+				if svc.ProgramName != nil && *svc.ProgramName != "" {
+					lbl = *svc.ProgramName
+					if svc.ServiceTypeName != nil && *svc.ServiceTypeName != "" {
+						lbl = *svc.ProgramName + " – " + *svc.ServiceTypeName
+					}
+				} else if svc.ServiceTypeName != nil {
 					lbl = *svc.ServiceTypeName
 				}
-				groupByDate[dateKey] = append(groupByDate[dateKey], groupBlock{startTime: startT, duration: dur, label: lbl})
+				if svc.ServiceTypeName != nil {
+					stName = *svc.ServiceTypeName
+				}
+				groupByDate[dateKey] = append(groupByDate[dateKey], groupBlock{
+					agendaServiceID:  svc.ID,
+					startTime:        startT,
+					duration:         dur,
+					label:            lbl,
+					serviceTypeName:  stName,
+					programName:      derefString(svc.ProgramName),
+					companyName:      derefString(svc.CompanyName),
+					participantCount: svc.ParticipantCount,
+					status:           string(svc.Status),
+				})
 			}
 		}
 	}
@@ -500,6 +525,8 @@ func (s *Service) GetWorkerCalendar(ctx context.Context, workerID uuid.UUID, mon
 				ServiceTypeID:   &a.ServiceTypeID,
 				PatientName:     label,
 				ServiceTypeName: derefString(a.ServiceTypeName),
+				TreatmentPlanID: a.TreatmentPlanID,
+				SessionNumber:   a.SessionNumber,
 				ScheduledAt:     a.ScheduledAt.Format("15:04"),
 				DurationMinutes: dur,
 				Type:            "individual",
@@ -510,11 +537,18 @@ func (s *Service) GetWorkerCalendar(ctx context.Context, workerID uuid.UUID, mon
 		// Add group agenda sessions to booked time.
 		for _, g := range groupByDate[dateStr] {
 			bookedMinutes += g.duration
+			svcID := g.agendaServiceID
 			summs = append(summs, worker.ApptSummary{
-				ScheduledAt:     g.startTime,
-				DurationMinutes: g.duration,
-				Type:            "group",
-				Label:           g.label,
+				AgendaServiceID:  &svcID,
+				ScheduledAt:      g.startTime,
+				DurationMinutes:  g.duration,
+				ServiceTypeName:  g.serviceTypeName,
+				ProgramName:      g.programName,
+				CompanyName:      g.companyName,
+				ParticipantCount: g.participantCount,
+				Type:             "group",
+				Label:            g.label,
+				Status:           g.status,
 			})
 		}
 
@@ -557,6 +591,26 @@ func (s *Service) SetAvailabilityRules(ctx context.Context, workerID uuid.UUID, 
 }
 
 // GetWorkerSlots calculates available time blocks for a worker for a given week.
+// GetWorkerGroupSessionHistory returns all group agenda services assigned to the worker,
+// ordered by date descending. Returns an empty slice (not nil) if none exist.
+func (s *Service) GetWorkerGroupSessionHistory(ctx context.Context, workerID uuid.UUID) ([]*program.AgendaServiceWithDate, error) {
+	if _, err := s.repo.FindByID(ctx, workerID); err != nil {
+		return nil, ErrNotFound
+	}
+	if s.programRepo == nil {
+		return []*program.AgendaServiceWithDate{}, nil
+	}
+	sessions, err := s.programRepo.ListWorkerGroupSessionHistory(ctx, workerID)
+	if err != nil {
+		return nil, err
+	}
+	if sessions == nil {
+		sessions = []*program.AgendaServiceWithDate{}
+	}
+	return sessions, nil
+}
+
+// GetWorkerSlots returns available booking slots for the worker for the given week.
 // weekStartStr must be "YYYY-MM-DD" (any day works, we normalise to Monday).
 // duration specifies slot length in minutes.
 func (s *Service) GetWorkerSlots(ctx context.Context, workerID uuid.UUID, weekStartStr string, duration int) ([]worker.TimeSlot, error) {

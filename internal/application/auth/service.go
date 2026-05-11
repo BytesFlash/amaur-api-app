@@ -8,7 +8,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"amaur/api/internal/domain/user"
+	"amaur/api/internal/domain/worker"
 	jwtpkg "amaur/api/pkg/jwt"
 	"amaur/api/pkg/password"
 )
@@ -23,12 +26,13 @@ var (
 const maxFailedAttempts = 5
 
 type Service struct {
-	userRepo user.Repository
-	jwt      *jwtpkg.Manager
+	userRepo   user.Repository
+	workerRepo worker.Repository
+	jwt        *jwtpkg.Manager
 }
 
-func NewService(userRepo user.Repository, jwt *jwtpkg.Manager) *Service {
-	return &Service{userRepo: userRepo, jwt: jwt}
+func NewService(userRepo user.Repository, workerRepo worker.Repository, jwt *jwtpkg.Manager) *Service {
+	return &Service{userRepo: userRepo, workerRepo: workerRepo, jwt: jwt}
 }
 
 func (s *Service) Login(ctx context.Context, req LoginRequest) (*LoginResponse, error) {
@@ -67,7 +71,8 @@ func (s *Service) Login(ctx context.Context, req LoginRequest) (*LoginResponse, 
 		return nil, err
 	}
 
-	accessToken, err := s.jwt.GenerateAccessToken(u.ID, u.Email, u.CompanyID, u.PatientID, roles, perms)
+	workerID := s.workerIDForUser(ctx, u.ID)
+	accessToken, err := s.jwt.GenerateAccessToken(u.ID, u.Email, u.CompanyID, u.PatientID, workerID, roles, perms)
 	if err != nil {
 		return nil, err
 	}
@@ -89,6 +94,7 @@ func (s *Service) Login(ctx context.Context, req LoginRequest) (*LoginResponse, 
 			Email:       u.Email,
 			CompanyID:   u.CompanyID,
 			PatientID:   u.PatientID,
+			WorkerID:    workerID,
 			FirstName:   u.FirstName,
 			LastName:    u.LastName,
 			Roles:       roles,
@@ -116,7 +122,8 @@ func (s *Service) Refresh(ctx context.Context, req RefreshRequest) (*LoginRespon
 	roles, _ := s.userRepo.GetRoleNames(ctx, u.ID)
 	perms, _ := s.userRepo.GetPermissionKeys(ctx, u.ID)
 
-	accessToken, err := s.jwt.GenerateAccessToken(u.ID, u.Email, u.CompanyID, u.PatientID, roles, perms)
+	workerID := s.workerIDForUser(ctx, u.ID)
+	accessToken, err := s.jwt.GenerateAccessToken(u.ID, u.Email, u.CompanyID, u.PatientID, workerID, roles, perms)
 	if err != nil {
 		return nil, err
 	}
@@ -131,9 +138,11 @@ func (s *Service) Refresh(ctx context.Context, req RefreshRequest) (*LoginRespon
 		RefreshToken: rawRefresh,
 		ExpiresAt:    time.Now().Add(15 * time.Minute),
 		User: UserDTO{
-			ID: u.ID, Email: u.Email,
+			ID:        u.ID,
+			Email:     u.Email,
 			CompanyID: u.CompanyID,
 			PatientID: u.PatientID,
+			WorkerID:  workerID,
 			FirstName: u.FirstName, LastName: u.LastName,
 			Roles: roles, Permissions: perms,
 		},
@@ -148,4 +157,14 @@ func (s *Service) Logout(ctx context.Context, userID interface{ String() string 
 func hashToken(raw string) string {
 	h := sha256.Sum256([]byte(raw))
 	return fmt.Sprintf("%x", h)
+}
+
+// workerIDForUser looks up the worker profile linked to a user account.
+// Returns nil if the user has no linked worker profile (not a professional).
+func (s *Service) workerIDForUser(ctx context.Context, userID uuid.UUID) *uuid.UUID {
+	w, err := s.workerRepo.FindByUserID(ctx, userID)
+	if err != nil || w == nil {
+		return nil
+	}
+	return &w.ID
 }

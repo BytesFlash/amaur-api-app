@@ -9,9 +9,12 @@ import (
 	appcssession "amaur/api/internal/application/caresession"
 	appcompany "amaur/api/internal/application/company"
 	appcontract "amaur/api/internal/application/contract"
+	appfu "amaur/api/internal/application/followuptask"
 	appatient "amaur/api/internal/application/patient"
 	appprogram "amaur/api/internal/application/program"
+	appsr "amaur/api/internal/application/sessionrecord"
 	appservicetype "amaur/api/internal/application/servicetype"
+	apptp "amaur/api/internal/application/treatmentplan"
 	appuser "amaur/api/internal/application/user"
 	appvisit "amaur/api/internal/application/visit"
 	appworker "amaur/api/internal/application/worker"
@@ -59,8 +62,11 @@ func New(db *gorm.DB, cfg *config.Config, log zerolog.Logger) http.Handler {
 	careSessionRepo := postgres.NewCareSessionRepository(db)
 	serviceTypeRepo := postgres.NewServiceTypeRepository(db)
 	appointmentRepo := postgres.NewAppointmentRepository(db)
+	treatmentPlanRepo := postgres.NewTreatmentPlanRepository(db)
+	sessionRecordRepo := postgres.NewSessionRecordRepository(db)
+	followUpTaskRepo := postgres.NewFollowUpTaskRepository(db)
 
-	authSvc := appauth.NewService(userRepo, jwt)
+	authSvc := appauth.NewService(userRepo, workerRepo, jwt)
 	patientSvc := appatient.NewService(patientRepo, userRepo, companyRepo)
 	userSvc := appuser.NewService(userRepo, workerRepo)
 	companySvc := appcompany.NewService(companyRepo, userSvc)
@@ -70,7 +76,13 @@ func New(db *gorm.DB, cfg *config.Config, log zerolog.Logger) http.Handler {
 	programSvc := appprogram.NewService(programRepo, contractRepo, careSessionRepo)
 	careSessionSvc := appcssession.NewService(careSessionRepo)
 	serviceTypeSvc := appservicetype.NewService(serviceTypeRepo)
-	appointmentSvc := appappt.NewService(appointmentRepo).WithProgramRepo(programRepo).WithWorkerRepo(workerRepo)
+	appointmentSvc := appappt.NewService(appointmentRepo).WithProgramRepo(programRepo).WithWorkerRepo(workerRepo).WithCareSessionRepo(careSessionRepo)
+	treatmentPlanSvc := apptp.NewService(treatmentPlanRepo, appointmentRepo).WithWorkerRepo(workerRepo)
+	sessionRecordSvc := appsr.NewService(sessionRecordRepo, treatmentPlanRepo)
+	followUpTaskSvc := appfu.NewService(followUpTaskRepo)
+
+	// Wire treatmentPlanRepo into appointmentSvc for recalculation on completion
+	appointmentSvc = appointmentSvc.WithTreatmentPlanRepo(treatmentPlanRepo)
 
 	authH := handlers.NewAuthHandler(authSvc)
 	patientH := handlers.NewPatientHandler(patientSvc)
@@ -83,6 +95,9 @@ func New(db *gorm.DB, cfg *config.Config, log zerolog.Logger) http.Handler {
 	careSessionH := handlers.NewCareSessionHandler(careSessionSvc)
 	serviceTypeH := handlers.NewServiceTypeHandler(serviceTypeSvc)
 	appointmentH := handlers.NewAppointmentHandler(appointmentSvc)
+	treatmentPlanH := handlers.NewTreatmentPlanHandler(treatmentPlanSvc)
+	sessionRecordH := handlers.NewSessionRecordHandler(sessionRecordSvc)
+	followUpTaskH := handlers.NewFollowUpTaskHandler(followUpTaskSvc)
 
 	// ── Health ─────────────────────────────────────────────────────────────
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -130,10 +145,13 @@ func New(db *gorm.DB, cfg *config.Config, log zerolog.Logger) http.Handler {
 					r.With(middleware.RequirePermission("clinical_records:view")).Get("/clinical-record", patientH.GetClinicalRecord)
 					r.With(middleware.RequirePermission("clinical_records:edit")).Put("/clinical-record", patientH.UpdateClinicalRecord)
 
-					// Portal login management
-					r.With(middleware.RequirePermission("patients:edit")).Get("/login", patientH.GetLoginInfo)
-					r.With(middleware.RequirePermission("patients:edit")).Post("/login", patientH.EnableLogin)
-					r.With(middleware.RequirePermission("patients:edit")).Delete("/login", patientH.DisableLogin)
+				// Portal login management
+				r.With(middleware.RequirePermission("patients:edit")).Get("/login", patientH.GetLoginInfo)
+				r.With(middleware.RequirePermission("patients:edit")).Post("/login", patientH.EnableLogin)
+				r.With(middleware.RequirePermission("patients:edit")).Delete("/login", patientH.DisableLogin)
+
+				// Group program participation history
+				r.With(middleware.RequirePatientSelfOrPermission("patients:view")).Get("/program-participations", programH.ListPatientParticipation)
 				})
 			})
 
@@ -162,6 +180,7 @@ func New(db *gorm.DB, cfg *config.Config, log zerolog.Logger) http.Handler {
 					r.With(middleware.RequirePermission("workers:view")).Get("/availability", workerH.GetAvailabilityRules)
 					r.With(middleware.RequirePermission("workers:view")).Get("/slots", workerH.GetWorkerSlots)
 					r.With(middleware.RequirePermission("workers:view")).Get("/calendar", workerH.GetWorkerCalendar)
+					r.With(middleware.RequirePermission("workers:view")).Get("/group-sessions", workerH.GroupSessionHistory)
 					r.With(middleware.RequirePermission("workers:edit")).Put("/specialties", workerH.SetWorkerSpecialties)
 				})
 			})
@@ -245,13 +264,15 @@ func New(db *gorm.DB, cfg *config.Config, log zerolog.Logger) http.Handler {
 
 			// Company programs (agenda recurrente)
 			r.Route("/programs", func(r chi.Router) {
-				r.With(middleware.RequirePermission("contracts:view")).Get("/", programH.List)
+				r.With(middleware.RequireAnyPermission("contracts:view", "care_sessions:view")).Get("/", programH.List)
 				r.With(middleware.RequirePermission("contracts:create")).Post("/", programH.Create)
 				r.Route("/{id}", func(r chi.Router) {
-					r.With(middleware.RequirePermission("contracts:view")).Get("/", programH.GetByID)
+					r.With(middleware.RequireAnyPermission("contracts:view", "care_sessions:view")).Get("/", programH.GetByID)
 					r.With(middleware.RequirePermission("contracts:edit")).Patch("/", programH.Update)
-					r.With(middleware.RequirePermission("contracts:view")).Get("/agendas", programH.ListProgramAgendas)
+					r.With(middleware.RequirePermission("contracts:edit")).Delete("/", programH.Delete)
+					r.With(middleware.RequireAnyPermission("contracts:view", "care_sessions:view")).Get("/agendas", programH.ListProgramAgendas)
 					r.With(middleware.RequirePermission("contracts:edit")).Post("/generate-agendas", programH.GenerateAgendas)
+					r.With(middleware.RequirePermission("contracts:edit")).Post("/regenerate-agendas", programH.RegenerateAgendas)
 				})
 			})
 
@@ -259,8 +280,8 @@ func New(db *gorm.DB, cfg *config.Config, log zerolog.Logger) http.Handler {
 			r.With(middleware.RequirePermission("visits:view")).Get("/agendas/{agendaId}/services", programH.ListAgendaServices)
 			r.With(middleware.RequirePermission("visits:edit")).Post("/agendas/{agendaId}/services", programH.CreateAgendaService)
 			r.With(middleware.RequirePermission("visits:view")).Get("/agenda-services/{agendaServiceId}/participants", programH.ListParticipants)
-			r.With(middleware.RequirePermission("visits:edit")).Post("/agenda-services/{agendaServiceId}/participants", programH.UpsertParticipants)
-			r.With(middleware.RequirePermission("visits:edit")).Post("/agenda-services/{agendaServiceId}/complete", programH.CompleteAgendaService)
+			r.With(middleware.RequireAnyPermission("visits:edit", "care_sessions:create")).Post("/agenda-services/{agendaServiceId}/participants", programH.UpsertParticipants)
+			r.With(middleware.RequireAnyPermission("visits:edit", "care_sessions:create")).Post("/agenda-services/{agendaServiceId}/complete", programH.CompleteAgendaService)
 
 			// Individual appointments
 			r.Route("/appointments", func(r chi.Router) {
@@ -272,6 +293,45 @@ func New(db *gorm.DB, cfg *config.Config, log zerolog.Logger) http.Handler {
 					r.With(middleware.RequirePermission("appointments:delete")).Delete("/", appointmentH.Delete)
 				})
 			})
+
+			// Treatment plans
+			r.With(middleware.RequirePermission("treatment_plans:view")).
+				Get("/treatment-plans/alerts", treatmentPlanH.GetAlerts)
+			r.Route("/treatment-plans", func(r chi.Router) {
+				r.With(middleware.RequirePermission("treatment_plans:view")).Get("/", treatmentPlanH.List)
+				r.With(middleware.RequirePermission("treatment_plans:create")).Post("/", treatmentPlanH.Create)
+				r.Route("/{id}", func(r chi.Router) {
+					r.With(middleware.RequirePermission("treatment_plans:view")).Get("/", treatmentPlanH.GetByID)
+					r.With(middleware.RequirePermission("treatment_plans:edit")).Patch("/", treatmentPlanH.Update)
+					r.With(middleware.RequirePermission("treatment_plans:edit")).Patch("/status", treatmentPlanH.UpdateStatus)
+					r.With(middleware.RequirePermission("treatment_plans:delete")).Delete("/", treatmentPlanH.Delete)
+				r.With(middleware.RequirePermission("treatment_plans:view")).Get("/history", treatmentPlanH.GetHistory)
+				r.With(middleware.RequirePermission("treatment_plans:edit")).
+					Post("/sessions/preview", treatmentPlanH.PreviewSessions)
+				r.With(middleware.RequirePermission("treatment_plans:edit")).
+					Post("/sessions/generate", treatmentPlanH.GenerateSessions)
+					// Session records nested under a plan
+					r.With(middleware.RequirePermission("session_records:view")).
+						Get("/session-records", sessionRecordH.ListByPlan)
+					r.With(middleware.RequirePermission("session_records:create")).
+						Post("/session-records", sessionRecordH.Create)
+				})
+			})
+
+			// Session record mutations (by record id)
+			r.With(middleware.RequirePermission("session_records:edit")).
+				Patch("/session-records/{recordId}", sessionRecordH.Update)
+
+			// Follow-up tasks
+			r.Route("/follow-up-tasks", func(r chi.Router) {
+				r.With(middleware.RequirePermission("follow_up_tasks:view")).Get("/", followUpTaskH.List)
+				r.With(middleware.RequirePermission("follow_up_tasks:create")).Post("/", followUpTaskH.Create)
+				r.Route("/{id}", func(r chi.Router) {
+					r.With(middleware.RequirePermission("follow_up_tasks:edit")).Patch("/", followUpTaskH.Update)
+					r.With(middleware.RequirePermission("follow_up_tasks:edit")).Delete("/", followUpTaskH.Delete)
+				})
+			})
+
 		})
 	})
 
